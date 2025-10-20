@@ -1,0 +1,19 @@
+[project]
+name = "research-crew"
+version = "0.1.0"
+description = "Distributed multi-agent research service."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Bishara Mekhaeil" }]
+
+dependencies = [
+    "pydantic>=2.7",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/research_crew"]

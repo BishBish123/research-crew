@@ -9,6 +9,7 @@ authors = [{ name = "Bishara Mekhaeil" }]
 
 dependencies = [
     "pydantic>=2.7",
+    "redis>=5.0",
 ]
 
 [build-system]

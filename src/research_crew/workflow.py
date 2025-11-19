@@ -1,0 +1,131 @@
+"""Durable workflow runner: parallel fan-out + retries + idempotency cache.
+
+The runner owns the contract that distributed engines (Inngest,
+Trigger.dev, Temporal) provide for free in production:
+
+* **Idempotency** — every step has a stable `dedup_key = H(run_id, agent, question)`.
+  Repeat calls return the cached AgentResult instead of re-running.
+* **Bounded retries with exponential backoff** — `max_attempts=3` by
+  default; per-attempt sleep is `base_backoff_s * 2**attempt`.
+* **Per-step timeout** — wall-clock guard so a stuck agent can't block
+  the whole run.
+* **Parallel fan-out** — `asyncio.gather` runs every agent at once;
+  partial failure does not abort the run.
+* **Step records** — every attempt is persisted via the injected store
+  so a `GET /runs/{id}` can render the full timeline.
+
+The whole interface is a single `WorkflowEngine` class so swapping it
+for a real Inngest call later is local — same input, same output.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from research_crew.agents import Agent
+from research_crew.models import AgentResult, StepRecord, StepStatus
+
+
+@dataclass
+class WorkflowConfig:
+    max_attempts: int = 3
+    base_backoff_s: float = 0.05
+    per_step_timeout_s: float = 30.0
+
+
+@dataclass
+class WorkflowEngine:
+    """Per-run engine. Cheap to construct; one instance per `/research` call."""
+
+    run_id: str
+    config: WorkflowConfig = field(default_factory=WorkflowConfig)
+    record_step: Callable[[StepRecord], Awaitable[None]] | None = None
+    cache_get: Callable[[str], Awaitable[AgentResult | None]] | None = None
+    cache_put: Callable[[str, AgentResult], Awaitable[None]] | None = None
+
+    async def run_one(self, agent: Agent, question: str) -> AgentResult:
+        """Execute one agent with the durability semantics above."""
+        dedup_key = self._dedup_key(agent, question)
+        if self.cache_get is not None:
+            cached = await self.cache_get(dedup_key)
+            if cached is not None:
+                # Surface the cache-hit so the caller can distinguish.
+                return cached.model_copy(update={"status": StepStatus.CACHED})
+
+        last_error: str | None = None
+        for attempt in range(1, self.config.max_attempts + 1):
+            await self._record(agent, attempt, StepStatus.RUNNING)
+            t0 = time.perf_counter()
+            try:
+                result = await asyncio.wait_for(
+                    agent.search(question), timeout=self.config.per_step_timeout_s
+                )
+            except TimeoutError:
+                last_error = f"timeout after {self.config.per_step_timeout_s}s"
+                await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+            else:
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                if result.status is StepStatus.SUCCEEDED:
+                    final = result.model_copy(update={"attempts": attempt, "elapsed_ms": elapsed})
+                    await self._record(agent, attempt, StepStatus.SUCCEEDED)
+                    if self.cache_put is not None:
+                        await self.cache_put(dedup_key, final)
+                    return final
+                last_error = result.error or "agent reported FAILED"
+                await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+            await self._sleep_backoff(attempt)
+
+        # All attempts exhausted.
+        return AgentResult(
+            agent=agent.name,
+            status=StepStatus.FAILED,
+            summary="",
+            error=last_error or "exhausted retries",
+            attempts=self.config.max_attempts,
+        )
+
+    async def run_parallel(self, agents: list[Agent], question: str) -> list[AgentResult]:
+        """Fan out to every agent concurrently. Partial failure does not abort."""
+        return await asyncio.gather(*(self.run_one(a, question) for a in agents))
+
+    # ---------- helpers ----------
+
+    def _dedup_key(self, agent: Agent, question: str) -> str:
+        digest = hashlib.blake2b(
+            f"{self.run_id}|{agent.name}|{question}".encode(), digest_size=12
+        ).hexdigest()
+        return f"step:{digest}"
+
+    async def _record(
+        self,
+        agent: Agent,
+        attempt: int,
+        status: StepStatus,
+        error: str | None = None,
+    ) -> None:
+        if self.record_step is None:
+            return
+        await self.record_step(
+            StepRecord(
+                run_id=self.run_id,
+                agent=agent.name,
+                status=status,
+                attempts=attempt,
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC) if status is not StepStatus.RUNNING else None,
+                error=error,
+            )
+        )
+
+    async def _sleep_backoff(self, attempt: int) -> None:
+        if attempt >= self.config.max_attempts:
+            return
+        await asyncio.sleep(self.config.base_backoff_s * (2 ** (attempt - 1)))

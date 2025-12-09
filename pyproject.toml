@@ -45,3 +45,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/research_crew"]
+
+[project.optional-dependencies]
+load = [
+    "locust>=2.30",
+]

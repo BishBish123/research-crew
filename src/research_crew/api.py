@@ -208,7 +208,6 @@ class _RateLimiter:
 # from the spec so the "Authorise" button doesn't appear for an open
 # endpoint.
 _AUTH_HEADER = "Authorization"
-_BEARER_PREFIX = "Bearer "
 _bearer_scheme = HTTPBearer(auto_error=False, description="Bearer token issued out-of-band.")
 
 
@@ -926,7 +925,6 @@ async def get_run(
     request: Request,
     _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> RunStatus:
-    _require_auth(request, _credentials)
     """Return the latest known state for `run_id`.
 
     Lookup precedence (the shadow exists for the bg-task store-outage path
@@ -939,6 +937,7 @@ async def get_run(
     3. Store says 404 but the shadow has it → return the shadow.
     4. Store outage → return the shadow if present, else 503.
     """
+    _require_auth(request, _credentials)
     store = _store(request)
     shadow = _terminal_shadow(request)
     try:

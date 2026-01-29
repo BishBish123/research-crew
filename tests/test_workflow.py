@@ -101,7 +101,7 @@ class TestSingleStep:
 
         result = await engine.run_one(SlowAgent(), "q")
         assert result.status is StepStatus.FAILED
-        assert "timeout" in (result.error or "").lower()
+        assert "timed out" in (result.error or "").lower()
 
 
 class TestParallel:

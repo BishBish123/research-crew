@@ -27,8 +27,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+import structlog
+
 from research_crew.agents import Agent
+from research_crew.errors import AgentExecutionError, AgentTimeoutError
 from research_crew.models import AgentResult, StepRecord, StepStatus
+
+_log = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -51,9 +56,11 @@ class WorkflowEngine:
     async def run_one(self, agent: Agent, question: str) -> AgentResult:
         """Execute one agent with the durability semantics above."""
         dedup_key = self._dedup_key(agent, question)
+        log = _log.bind(run_id=self.run_id, agent=agent.name.value, dedup_key=dedup_key)
         if self.cache_get is not None:
             cached = await self.cache_get(dedup_key)
             if cached is not None:
+                log.info("workflow.cache_hit")
                 # Surface the cache-hit so the caller can distinguish.
                 return cached.model_copy(update={"status": StepStatus.CACHED})
 
@@ -66,24 +73,50 @@ class WorkflowEngine:
                     agent.search(question), timeout=self.config.per_step_timeout_s
                 )
             except TimeoutError:
-                last_error = f"timeout after {self.config.per_step_timeout_s}s"
+                err = AgentTimeoutError(agent.name.value, self.config.per_step_timeout_s)
+                last_error = str(err)
+                log.warning("workflow.timeout", attempt=attempt, timeout_s=err.timeout_s)
                 await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
-            except Exception as exc:
+            except asyncio.CancelledError:
+                # Cooperative cancellation: record the failure, then let the
+                # cancellation propagate so the surrounding task tree unwinds.
+                last_error = "cancelled"
+                log.warning("workflow.cancelled", attempt=attempt)
+                await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                raise
+            except Exception as exc:  # agents are user code; we wrap in AgentExecutionError
+                wrapped = AgentExecutionError(agent.name.value, exc)
                 last_error = f"{type(exc).__name__}: {exc}"
+                log.warning(
+                    "workflow.agent_error",
+                    attempt=attempt,
+                    exc_type=type(exc).__name__,
+                    error=str(exc),
+                )
                 await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                # Suppress chaining so loggers don't double-report; semantic
+                # info is preserved in `AgentExecutionError.original`.
+                del wrapped
             else:
                 elapsed = (time.perf_counter() - t0) * 1000.0
                 if result.status is StepStatus.SUCCEEDED:
                     final = result.model_copy(update={"attempts": attempt, "elapsed_ms": elapsed})
                     await self._record(agent, attempt, StepStatus.SUCCEEDED)
+                    log.info("workflow.success", attempt=attempt, elapsed_ms=elapsed)
                     if self.cache_put is not None:
                         await self.cache_put(dedup_key, final)
                     return final
                 last_error = result.error or "agent reported FAILED"
+                log.warning("workflow.agent_returned_failed", attempt=attempt, error=last_error)
                 await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
             await self._sleep_backoff(attempt)
 
         # All attempts exhausted.
+        log.warning(
+            "workflow.exhausted",
+            attempts=self.config.max_attempts,
+            last_error=last_error,
+        )
         return AgentResult(
             agent=agent.name,
             status=StepStatus.FAILED,

@@ -15,6 +15,7 @@ smallest defensible interim. See README "Limitations".
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -131,6 +132,42 @@ class TestReconcileOrphanRuns:
         assert unchanged.state is StepStatus.RUNNING
         assert unchanged.error is None
         assert unchanged.owner_id == "peer-worker-id"
+        await fake.aclose()
+
+    async def test_lifespan_reconciles_default_jsondumps_spaced_blob(self) -> None:
+        """Regression: a RUNNING blob written with stdlib ``json.dumps``
+        (default spacing inserts a space after the colon, producing
+        ``"state": "running"``) must still be detected by the
+        reconciler's pre-filter and flipped. The previous literal-
+        substring check would silently skip it, leaving the run stuck
+        RUNNING after a process restart.
+        """
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+
+        # Build the blob via json.dumps (NOT model_dump_json) so the
+        # default-spaced encoding is exercised.
+        run = RunStatus(
+            run_id="spaced-orphan",
+            question="what is python",
+            state=StepStatus.RUNNING,
+        )
+        spaced_blob = json.dumps(run.model_dump(mode="json"))
+        assert '"state": "running"' in spaced_blob, (
+            "json.dumps default spacing must produce a space after the colon "
+            "for this regression test to be meaningful"
+        )
+        await fake.set(f"{store.prefix}:run:spaced-orphan", spaced_blob)
+
+        app.state.redis = fake
+        app.state.store = store
+
+        await _reconcile_orphan_runs(app)
+
+        recovered = await store.get_run("spaced-orphan")
+        assert recovered is not None
+        assert recovered.state is StepStatus.FAILED
+        assert recovered.error == "abandoned by previous process"
         await fake.aclose()
 
     async def test_lifespan_reconciles_stale_heartbeat(self) -> None:

@@ -7,6 +7,7 @@ import contextlib
 import ipaddress
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -71,6 +72,14 @@ _DEFAULT_MAX_BUCKETS = 10_000
 # ``RESEARCH_HEARTBEAT_STALE_S``.
 _HEARTBEAT_INTERVAL_S = 30.0
 _DEFAULT_STALE_HEARTBEAT_S = 120
+
+# Whitespace-tolerant pre-filter for the JSON `state: running` field.
+# A naive substring check on the literal `"state":"running"` misses
+# blobs serialised with default `json.dumps` spacing (which inserts a
+# space after the colon), silently undercounting RUNNING records. We
+# tolerate any inter-token whitespace before parsing, then re-check on
+# the parsed payload to avoid false positives in nested fields.
+_RUNNING_STATE_RE = re.compile(r'"state"\s*:\s*"running"')
 
 # Process-wide identifier stamped on every RUNNING run claimed by this
 # worker. A peer instance reading a foreign ``owner_id`` knows the run
@@ -458,7 +467,7 @@ async def _load_running_run(redis_client: aioredis.Redis, key: str) -> RunStatus
     except Exception as exc:  # transient — log and skip this key
         _log.warning("api.reconcile_get_failed", key=key, error=str(exc))
         return None
-    if raw is None or '"state":"running"' not in raw:
+    if raw is None or not _RUNNING_STATE_RE.search(raw):
         return None
     try:
         payload = json.loads(raw)
@@ -806,11 +815,15 @@ async def _count_active_runs(request: Request) -> int | None:
             if raw is None:
                 continue
             # Parsing every record on every probe would be wasteful; a
-            # cheap substring check on the JSON `state` field is enough
-            # for this counter — false positives would require a run
-            # whose `question` literally contains `"state":"running"`,
-            # which Pydantic would reject on submit.
-            if '"state":"running"' in raw:
+            # cheap regex pre-filter on the JSON `state` field is
+            # enough for this counter. The regex tolerates the
+            # whitespace `json.dumps` inserts after the colon — the
+            # earlier literal-substring check missed those records and
+            # silently undercounted RUNNING runs. False positives would
+            # require a run whose `question` literally contains
+            # something matching ``"state": "running"`` after
+            # serialisation, which Pydantic would reject on submit.
+            if _RUNNING_STATE_RE.search(raw):
                 running += 1
         return running
     except Exception as exc:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 import fakeredis.aioredis as fake_aioredis
@@ -95,6 +96,50 @@ class TestHealthCounters:
         resp = await client.get("/health")
         body = resp.json()
         assert body["active_runs"] == 3, body
+
+    async def test_active_runs_counts_default_jsondumps_spacing(
+        self, client: AsyncClient
+    ) -> None:
+        """Regression: a RUNNING blob written with the stdlib
+        ``json.dumps`` default spacing serialises ``"state": "running"``
+        (note the space after the colon). The previous literal-substring
+        pre-filter looked for ``"state":"running"`` and silently skipped
+        these records, undercounting active runs.
+
+        Plant such a blob directly via the underlying Redis client so
+        the regression is exercised exactly the way an external writer
+        — for example a peer instance using a different Pydantic
+        version, or a manual recovery script — would produce it.
+        """
+        store = app.state.store
+        redis_client = app.state.redis
+        # Compact-spaced blob via Pydantic's model_dump_json — already
+        # covered by the existing test, but include one so the count
+        # below is unambiguous.
+        await store.put_run(
+            RunStatus(
+                run_id="running-compact",
+                question="compact",
+                state=StepStatus.RUNNING,
+            )
+        )
+        # Default-spaced blob via json.dumps — this is the regression.
+        run = RunStatus(
+            run_id="running-spaced",
+            question="spaced",
+            state=StepStatus.RUNNING,
+        )
+        spaced_payload = run.model_dump(mode="json")
+        spaced_blob = json.dumps(spaced_payload)
+        assert '"state": "running"' in spaced_blob, (
+            "json.dumps default spacing must produce a space after the colon "
+            "for this regression test to be meaningful"
+        )
+        await redis_client.set(f"{store.prefix}:run:running-spaced", spaced_blob)
+
+        resp = await client.get("/health")
+        body = resp.json()
+        assert body["active_runs"] == 2, body
 
     async def test_shadow_size_reports_zero_when_empty(self, client: AsyncClient) -> None:
         if hasattr(app.state, "terminal_shadow") and hasattr(app.state.terminal_shadow, "clear"):

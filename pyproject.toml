@@ -39,13 +39,6 @@ Repository = "https://github.com/BishBish123/research-crew"
 research-api = "research_crew.api:main"
 research = "research_crew.cli:app"
 
-[build-system]
-requires = ["hatchling>=1.25"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/research_crew"]
-
 [project.optional-dependencies]
 load = [
     "locust>=2.30",
@@ -56,9 +49,17 @@ dev = [
     "pytest-cov>=5.0",
     "httpx>=0.27",
     "fakeredis>=2.24",
+    "hypothesis>=6.100",
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/research_crew"]
 
 [tool.ruff]
 line-length = 100

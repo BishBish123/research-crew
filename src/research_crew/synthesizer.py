@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from research_crew.models import (
     AgentName,
@@ -94,13 +95,36 @@ def _iter_all_citations(results: list[AgentResult]) -> Iterable[Citation]:
 
 
 def _dedupe_citations(citations: Iterable[Citation]) -> Iterable[Citation]:
-    """Stable-order dedupe by URL — the first occurrence wins."""
+    """Stable-order dedupe by normalized URL — the first occurrence wins.
+
+    Normalization collapses near-duplicates that real search backends
+    routinely emit:
+
+    * scheme + host case-folded (``HTTPS://Example.com`` ≡ ``https://example.com``)
+    * trailing slash on the path stripped (``/foo/`` ≡ ``/foo``)
+    * leading ``www.`` host prefix stripped
+    """
     seen: set[str] = set()
     for c in citations:
-        if c.url in seen:
+        key = _normalize_url(c.url)
+        if key in seen:
             continue
-        seen.add(c.url)
+        seen.add(key)
         yield c
+
+
+def _normalize_url(url: str) -> str:
+    """Best-effort URL canonicalisation for dedupe purposes only."""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return url
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
 
 
 def per_agent_citation_count(results: list[AgentResult]) -> dict[AgentName, int]:

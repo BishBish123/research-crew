@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
+import structlog
 import typer
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -23,29 +26,54 @@ from research_crew.store import RedisRunStore, RunStore
 from research_crew.synthesizer import StitchSynthesizer
 from research_crew.workflow import WorkflowEngine
 
-app = FastAPI(title="research-crew", version="0.1.0")
+_log = structlog.get_logger(__name__)
 
 
 def _redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    client = aioredis.from_url(_redis_url(), decode_responses=True)
-    app.state.redis = client
-    app.state.store = RedisRunStore(client)
+@contextlib.asynccontextmanager
+async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+    """Open the Redis client on startup; close it cleanly on shutdown.
+
+    Tests can override `app_.state.redis` / `app_.state.store` *before*
+    issuing requests because the lifespan sees ``getattr(..., None)`` and
+    only initialises what's missing.
+    """
+    if getattr(app_.state, "redis", None) is None:
+        client = aioredis.from_url(_redis_url(), decode_responses=True)
+        app_.state.redis = client
+        app_.state.store = RedisRunStore(client)
+    try:
+        yield
+    finally:
+        if getattr(app_.state, "redis", None) is not None:
+            with contextlib.suppress(Exception):
+                await app_.state.redis.aclose()
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await app.state.redis.close()
+app = FastAPI(title="research-crew", version="0.1.0", lifespan=_lifespan)
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    pong = await app.state.redis.ping()
+async def health(request: Request) -> dict[str, str]:
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="redis client not initialised")
+    try:
+        pong = await redis_client.ping()
+    except Exception as exc:  # surface any connection error as 503
+        _log.warning("api.health_redis_down", error=str(exc))
+        raise HTTPException(status_code=503, detail=f"redis unavailable: {exc}") from exc
     return {"status": "ok", "redis": "up" if pong else "down"}
+
+
+def _store(request: Request) -> RunStore:
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+    return store  # type: ignore[no-any-return]
 
 
 @app.post("/research", status_code=202)
@@ -54,16 +82,17 @@ async def submit_research(
 ) -> dict[str, str]:
     """Enqueue a research run. Returns immediately with the run_id."""
     run_id = uuid.uuid4().hex
-    store: RunStore = request.app.state.store
+    store = _store(request)
     run = RunStatus(run_id=run_id, question=payload.question, state=StepStatus.RUNNING)
     await store.put_run(run)
+    _log.info("api.run_submitted", run_id=run_id, question_len=len(payload.question))
     background.add_task(_execute_run, store, run_id, payload)
     return {"run_id": run_id, "status_url": f"/runs/{run_id}"}
 
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> RunStatus:
-    store: RunStore = request.app.state.store
+    store = _store(request)
     run = await store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")

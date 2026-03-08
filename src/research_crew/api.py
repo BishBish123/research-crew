@@ -1115,6 +1115,26 @@ async def _run_workflow_and_persist(
     await _stop_task(heartbeat_task)
     finished = await store.get_run(run_id)
     if finished is None:
+        # The run record vanished between submit and finalisation —
+        # most likely a TTL eviction or a peer process clobbering the
+        # key. We can't return success without a record (the caller
+        # would never see a terminal state), so synthesise a minimal
+        # FAILED RunStatus from what we still know in-process and
+        # persist it through the same shadow-fallback path the regular
+        # terminal write uses. Without this, callers polling
+        # /runs/{id} would 404 forever and the in-process shadow would
+        # never get populated either.
+        _log.warning("api.run_record_missing_at_finalization", run_id=run_id)
+        synthesised = RunStatus(
+            run_id=run_id,
+            question=payload.question,
+            state=StepStatus.FAILED,
+            finished_at=datetime.now(UTC),
+            total_latency_ms=(time.monotonic() - run_started_at) * 1000.0,
+            error="run record missing at finalization",
+            report=report,
+        )
+        await _persist_terminal(store, shadow, synthesised, agent_label="workflow_record_missing")
         _emit_run_completed(
             run_id=run_id,
             run_started_at=run_started_at,

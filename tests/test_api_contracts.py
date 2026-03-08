@@ -97,9 +97,7 @@ class TestHealthCounters:
         body = resp.json()
         assert body["active_runs"] == 3, body
 
-    async def test_active_runs_counts_default_jsondumps_spacing(
-        self, client: AsyncClient
-    ) -> None:
+    async def test_active_runs_counts_default_jsondumps_spacing(self, client: AsyncClient) -> None:
         """Regression: a RUNNING blob written with the stdlib
         ``json.dumps`` default spacing serialises ``"state": "running"``
         (note the space after the colon). The previous literal-substring

@@ -434,6 +434,74 @@ class TestExecuteRunCancellation:
         await fake.aclose()
 
 
+class TestExecuteRunMissingRecordAtFinalization:
+    """If the run record is missing when finalisation tries to read it
+    (TTL eviction, peer process clobbering the key, …) the workflow
+    must still synthesise a terminal FAILED RunStatus and persist it
+    via the same shadow-fallback path the regular terminal write uses
+    — otherwise callers polling /runs/{id} would 404 forever and the
+    in-process shadow would never get populated either.
+    """
+
+    async def test_missing_record_persists_synthesised_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        shadow = _TerminalShadow()
+
+        running = RunStatus(
+            run_id="vanished-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+        )
+        await store.put_run(running)
+
+        async def _empty_run_parallel(
+            self: object, agents: object, question: object
+        ) -> list[object]:
+            return []
+
+        # Drive the workflow to the finalisation read with a stub that
+        # also deletes the run record just before finalisation. This is
+        # the precise race the early-return guards against.
+        original_get_run = store.get_run
+
+        async def _vanishing_get_run(run_id: str) -> RunStatus | None:
+            if run_id == "vanished-1":
+                # Simulate a TTL eviction / peer clobber by deleting the
+                # backing key right before we return the answer.
+                await fake.delete(f"{store.prefix}:run:vanished-1")
+                return None
+            return await original_get_run(run_id)
+
+        monkeypatch.setattr(
+            api_module.WorkflowEngine, "run_parallel", _empty_run_parallel, raising=True
+        )
+        store.get_run = _vanishing_get_run  # type: ignore[method-assign]
+
+        await _execute_run(
+            store,
+            shadow,
+            "vanished-1",
+            ResearchRequest(question="what is python"),
+        )
+
+        # With the key actively deleted by the stub, the store has no
+        # record — but the synthesised FAILED must surface in the
+        # shadow so /runs/{id} can still serve a terminal state.
+        shadow_entry = shadow.get("vanished-1")
+        store_entry = await original_get_run("vanished-1")
+        terminal = shadow_entry or store_entry
+        assert terminal is not None, (
+            "missing-record path must persist via store OR shadow, not vanish"
+        )
+        assert terminal.state is StepStatus.FAILED
+        assert terminal.error == "run record missing at finalization"
+        assert terminal.finished_at is not None
+        await fake.aclose()
+
+
 class TestDevMode:
     """``RESEARCH_DEV_MODE`` is the local-loop opt-out for the
     auth-disabled WARNING. Truthy values demote the log to INFO; the

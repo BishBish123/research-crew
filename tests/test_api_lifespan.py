@@ -434,6 +434,93 @@ class TestExecuteRunCancellation:
         await fake.aclose()
 
 
+class TestExecuteRunFailurePopulatesError:
+    """`_execute_run`'s exception path must record an explanation on
+    the terminal FAILED RunStatus. Without that, a client polling
+    /runs/{id} after a workflow / synthesizer crash sees only
+    state=failed with no run-level message — the structured-log line
+    is server-side only and the caller has no signal beyond the
+    terminal state.
+    """
+
+    async def test_run_parallel_raises_populates_run_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        shadow = _TerminalShadow()
+
+        running = RunStatus(
+            run_id="bg-fail-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+        )
+        await store.put_run(running)
+
+        async def _boom(self: object, agents: object, question: object) -> object:
+            raise RuntimeError("agents went up in flames")
+
+        monkeypatch.setattr(api_module.WorkflowEngine, "run_parallel", _boom, raising=True)
+
+        await _execute_run(
+            store,
+            shadow,
+            "bg-fail-1",
+            ResearchRequest(question="what is python"),
+        )
+
+        recovered = await store.get_run("bg-fail-1")
+        assert recovered is not None
+        assert recovered.state is StepStatus.FAILED
+        assert recovered.error is not None
+        assert "agents went up in flames" in recovered.error
+        assert recovered.finished_at is not None
+        await fake.aclose()
+
+    async def test_synthesize_raises_populates_run_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        shadow = _TerminalShadow()
+
+        running = RunStatus(
+            run_id="bg-fail-2",
+            question="what is python",
+            state=StepStatus.RUNNING,
+        )
+        await store.put_run(running)
+
+        async def _empty_run_parallel(
+            self: object, agents: object, question: object
+        ) -> list[object]:
+            return []
+
+        async def _broken_synthesize(self: object, *args: object, **kwargs: object) -> object:
+            raise ValueError("synthesizer choked")
+
+        monkeypatch.setattr(
+            api_module.WorkflowEngine, "run_parallel", _empty_run_parallel, raising=True
+        )
+        monkeypatch.setattr(
+            api_module.StitchSynthesizer, "synthesize", _broken_synthesize, raising=True
+        )
+
+        await _execute_run(
+            store,
+            shadow,
+            "bg-fail-2",
+            ResearchRequest(question="what is python"),
+        )
+
+        recovered = await store.get_run("bg-fail-2")
+        assert recovered is not None
+        assert recovered.state is StepStatus.FAILED
+        assert recovered.error is not None
+        assert "synthesizer choked" in recovered.error
+        await fake.aclose()
+
+
 class TestExecuteRunMissingRecordAtFinalization:
     """If the run record is missing when finalisation tries to read it
     (TTL eviction, peer process clobbering the key, …) the workflow

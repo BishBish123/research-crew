@@ -1264,6 +1264,14 @@ async def _execute_run(
         failed.state = StepStatus.FAILED
         failed.finished_at = datetime.now(UTC)
         failed.total_latency_ms = (time.monotonic() - run_started_at) * 1000.0
+        # Always populate failed.error from the caught exception unless
+        # a more specific error is already present (e.g. an earlier
+        # workflow step persisted one). Without this, callers polling
+        # /runs/{id} after a workflow / synthesizer crash see only
+        # state=failed with no explanation — the run-level message is
+        # lost despite the structured-log line above.
+        if not failed.error:
+            failed.error = repr(exc)
         await _persist_terminal(store, shadow, failed, agent_label="workflow_failed")
         _emit_run_completed(
             run_id=run_id,

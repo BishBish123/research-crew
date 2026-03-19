@@ -110,22 +110,34 @@ make load   # opens Locust on http://localhost:8089
 ## Tests
 
 ```bash
-make test                # 20 unit tests (workflow, synthesizer, API via fakeredis)
+make test                # 90+ unit tests (workflow, synthesizer, store, API, agents, properties)
 make test-integration    # tests gated on a real Redis at $REDIS_URL
 make check               # ruff + mypy --strict
 ```
 
 What's covered today:
 
-- **Workflow durability** — idempotency cache hit, retry-then-succeed, exhausted retries, per-step timeout, parallel partial-failure isolation.
-- **Synthesizer correctness** — citation dedupe by URL, failure surfacing, all-failed empty path, per-agent caps.
-- **End-to-end API** — submit → background → poll → report renders, 404 on unknown run, 422 on too-short question.
+- **Workflow durability** — idempotency cache hit, retry-then-succeed, timeout-then-retry, exhausted retries, per-step timeout, parallel partial-failure isolation, cancellation cleanup.
+- **Idempotency-key properties** — Hypothesis property tests assert determinism + per-component sensitivity across 200 random examples per property.
+- **Store contract** — every method round-trips on both `InMemoryRunStore` and `RedisRunStore` (via fakeredis), parametrized over both.
+- **Synthesizer correctness** — citation dedupe by URL (incl. case / trailing-slash / `www.` collapse), failure surfacing, all-failed empty path, per-agent caps, query-string preservation.
+- **API contracts** — submit → background → poll → report renders; 404 on unknown run; 422 on bad payloads (missing, too long, wrong type, unknown agent); 503 on uninitialised store; `/health` shape contract.
+- **Agent base** — Protocol conformance, determinism, latency simulation, failure injection.
+
+## Design docs
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — layered shape, design rationale, future work.
+- [`docs/adrs/ADR-001-redis-store.md`](docs/adrs/ADR-001-redis-store.md) — three-keyspace Redis design.
+- [`docs/adrs/ADR-002-idempotency-key.md`](docs/adrs/ADR-002-idempotency-key.md) — `blake2b` digest derivation + properties.
+- [`docs/adrs/ADR-003-retry-policy.md`](docs/adrs/ADR-003-retry-policy.md) — bounded exponential backoff.
+- [`docs/load-test-results.md`](docs/load-test-results.md) — Locust scenario shape + reference numbers.
 
 ## Layout
 
 ```
 src/research_crew/
   models.py        Pydantic types (Citation, AgentResult, ResearchReport, RunStatus)
+  errors.py        Domain-specific exception hierarchy
   agents/          Agent protocol + MockAgent + default crew of 5
   workflow.py      WorkflowEngine: parallel + retries + idempotency + timeouts
   synthesizer.py   StitchSynthesizer (no LLM); plug-point Protocol for LLM swap
@@ -135,7 +147,8 @@ src/research_crew/
 
 load/locustfile.py Locust scenario for the orchestration layer
 docker-compose.yml Redis 7.4
-tests/             20 unit + integration markers
+docs/              ADRs + load-test write-up
+tests/             90+ unit tests (incl. Hypothesis property tests + store contract)
 ```
 
 ## Honest limitations

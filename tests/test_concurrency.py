@@ -1,12 +1,10 @@
 """Concurrency tests for the workflow runner.
 
 The contract: two concurrent `run_one(...)` calls with the same
-`(run_id, agent, question)` triple are still safe — at most one
-agent invocation should actually fire (the second waits and reads
-the cache). We assert the milder version of that here: the second
-caller eventually observes a CACHED result and the agent is called
-*at most* twice (once is the win path; twice is the unlucky race
-where both winners commit before reading).
+`(run_id, agent, question)` triple are atomic — the agent fires
+exactly once, the loser observes a CACHED result. The per-key
+lock in `WorkflowEngine` makes the read-then-write idempotency
+check a single critical section.
 """
 
 from __future__ import annotations
@@ -32,7 +30,9 @@ class _Counter:
 
 
 class TestConcurrentSameKey:
-    async def test_two_callers_same_key_at_least_one_cached(self) -> None:
+    async def test_two_callers_same_key_run_agent_once(self) -> None:
+        """Two `gather`-launched callers with the same dedup key must
+        invoke the agent exactly once; the loser reads the cache."""
         store = InMemoryRunStore()
         engine = WorkflowEngine(
             run_id="r-conc",
@@ -43,16 +43,13 @@ class TestConcurrentSameKey:
         )
         agent = _Counter()
 
-        # First completes, populates cache; second observes the cache hit.
-        first = await engine.run_one(agent, "q")
-        second = await engine.run_one(agent, "q")
-        assert first.status is StepStatus.SUCCEEDED
-        assert second.status is StepStatus.CACHED
+        first, second = await asyncio.gather(engine.run_one(agent, "q"), engine.run_one(agent, "q"))
+        assert {first.status, second.status} == {StepStatus.SUCCEEDED, StepStatus.CACHED}
         assert agent.calls == 1
 
-    async def test_truly_parallel_callers_call_agent_at_most_twice(self) -> None:
-        """When both callers see no cache before the first commits, both run.
-        We only assert the upper-bound: never *more* than 2 calls."""
+    async def test_truly_parallel_callers_call_agent_exactly_once(self) -> None:
+        """Even with no prior cache priming, the per-key lock guarantees
+        a single agent invocation across two concurrent callers."""
         store = InMemoryRunStore()
         engine = WorkflowEngine(
             run_id="r-conc-2",
@@ -63,9 +60,26 @@ class TestConcurrentSameKey:
         )
         agent = _Counter()
         a, b = await asyncio.gather(engine.run_one(agent, "q"), engine.run_one(agent, "q"))
-        # Exactly one of the two answers may be CACHED, but both must be terminal.
-        assert {a.status, b.status} <= {StepStatus.SUCCEEDED, StepStatus.CACHED}
-        assert agent.calls <= 2
+        # One winner (SUCCEEDED), one loser (CACHED).
+        assert {a.status, b.status} == {StepStatus.SUCCEEDED, StepStatus.CACHED}
+        assert agent.calls == 1
+
+    async def test_many_concurrent_callers_call_agent_exactly_once(self) -> None:
+        """Stress: 16 simultaneous callers, still exactly one agent call."""
+        store = InMemoryRunStore()
+        engine = WorkflowEngine(
+            run_id="r-conc-many",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=store.append_step,
+            cache_get=store.cache_get,
+            cache_put=store.cache_put,
+        )
+        agent = _Counter()
+        results = await asyncio.gather(*(engine.run_one(agent, "q") for _ in range(16)))
+        statuses = [r.status for r in results]
+        assert statuses.count(StepStatus.SUCCEEDED) == 1
+        assert statuses.count(StepStatus.CACHED) == 15
+        assert agent.calls == 1
 
 
 class TestRunOnePerEngineIsolated:

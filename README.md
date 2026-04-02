@@ -87,14 +87,33 @@ uv run research "what is python"
 # Same with retry-path exercise (forces re-attempts)
 uv run research "test retries" --failure-rate 0.5
 
-# Run the API (wait for `Application startup complete.` before curling)
+# Run the API. `make api` derives REDIS_URL from REDIS_PORT, so the
+# same override flows through: REDIS_PORT=6390 make api & — an
+# explicit REDIS_URL still wins.
 make api &
+
+# Wait for the service to be ready before curling. `make api &`
+# returns before uvicorn finishes startup; the loop polls /health.
+until curl -fsS http://localhost:8000/health > /dev/null; do sleep 0.2; done
+
 curl -sS -X POST -H 'content-type: application/json' \
     -d '{"question":"how does Inngest handle step retries"}' \
     http://localhost:8000/research
 
-# Get the run status
+# Subset of agents (the `agents` field is optional; default = all 5).
+curl -sS -X POST -H 'content-type: application/json' \
+    -d '{"question":"how does Inngest handle step retries","agents":["web_search","scholar"]}' \
+    http://localhost:8000/research
+
+# Get the run status. NOTE: with RESEARCH_API_TOKEN set this returns
+# 401 unless you also pass `-H "Authorization: Bearer $RESEARCH_API_TOKEN"`;
+# the Quick Start above runs the API unauthenticated.
 curl -sS http://localhost:8000/runs/<run_id> | jq .
+
+# Interactive API explorer + machine-readable schema:
+#   http://localhost:8000/docs       (Swagger UI)
+#   http://localhost:8000/redoc      (ReDoc)
+#   http://localhost:8000/openapi.json
 ```
 
 ## API
@@ -104,6 +123,9 @@ curl -sS http://localhost:8000/runs/<run_id> | jq .
 | `GET` | `/health` | — | `{ "status": "ok", "redis": "up", "active_runs": 0, "shadow_size": 0 }`; `503 { "detail": "redis unavailable: ..." }` if Redis is unreachable |
 | `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "http://host/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
+| `GET` | `/docs` | — | FastAPI's Swagger UI (interactive API explorer). |
+| `GET` | `/redoc` | — | ReDoc rendering of the same OpenAPI spec. |
+| `GET` | `/openapi.json` | — | Raw OpenAPI 3 schema. |
 
 The `steps` array on `RunStatus` is an append-only audit log: every
 agent attempt writes one `running` row when it starts and one terminal
@@ -164,7 +186,8 @@ spoof XFF to get a fresh bucket.
 | `RESEARCH_DEV_MODE` | *(unset)* | When truthy (`1`, `true`, `yes`, `on`), demotes the unauthenticated-mode `api.auth_disabled` log from WARNING to INFO. Local dev opt-out only — does not affect auth enforcement. |
 | `RESEARCH_RATE_LIMIT_PER_MIN` | `10` | Per-IP sliding-window cap on `POST /research`. Exhausted callers get `429` + `Retry-After`. |
 | `RESEARCH_TRUSTED_PROXIES` | *(empty)* | CSV of proxy IPs. When the immediate peer is in this set, the limiter keys on the first non-trusted IP from `X-Forwarded-For`. Empty = ignore XFF (safe default for direct exposure). |
-| `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. |
+| `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. Read by both the API service AND the CLI when the latter is pointed at a Redis-backed store. `make api` derives this from `REDIS_PORT` if unset, so `REDIS_PORT=6390 make up && REDIS_PORT=6390 make api` works without setting both. |
+| `REDIS_PORT` | `6379` | Host port that `make up` binds the Redis container to (override when 6379 is taken on the host). `make api` reads it to derive a matching `REDIS_URL` when none is set. CLI / hand-rolled `uvicorn` invocations do **not** read it — use `REDIS_URL` directly there. |
 | `RESEARCH_REDIS_PREFIX` | `research` | Key prefix for run / step / cache keys. Set per environment to share one Redis without cross-talk. |
 | `RESEARCH_HEARTBEAT_STALE_S` | `120` | Heartbeat-staleness threshold for the lifespan orphan reconciler. A peer's `RUNNING` run is left alone when its heartbeat age is less than or equal to this value; the run is considered abandoned only when the age is strictly greater than (older than) the threshold. Bumps every 30s while live. |
 | `RESEARCH_SHADOW_MAX` | `10000` | Maximum entries in the in-process terminal-state shadow cache (only populated while the run store is unreachable). Oldest entry evicted on overflow. |

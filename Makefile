@@ -44,8 +44,14 @@ test-all: ## All tests
 	$(UV) run pytest
 
 .PHONY: api
-api: ## Run the FastAPI service locally
-	$(UV) run research-api
+api: ## Run the FastAPI service locally (honours REDIS_PORT to derive REDIS_URL)
+	@# Keep REDIS_PORT and REDIS_URL coherent: if the user pointed Redis
+	@# at a non-default host port via REDIS_PORT (e.g. to dodge a 6379
+	@# conflict with a host-installed redis-server), derive REDIS_URL
+	@# from it automatically. An explicit REDIS_URL still wins so the
+	@# override path is unchanged for advanced users.
+	REDIS_URL=$${REDIS_URL:-redis://localhost:$${REDIS_PORT:-6379}/0} \
+		$(UV) run research-api
 
 .PHONY: up
 up: ## Start Redis container (override port: REDIS_PORT=6390 make up)

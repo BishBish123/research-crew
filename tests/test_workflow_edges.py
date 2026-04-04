@@ -196,3 +196,35 @@ class TestNoCacheStillRuns:
         agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
         result = await engine.run_one(agent, "q")
         assert result.status is StepStatus.SUCCEEDED
+
+
+class TestStepRecordTimings:
+    async def test_terminal_step_preserves_real_started_at(self) -> None:
+        """Terminal records must carry the wall-clock start captured at
+        the top of `run_one` so callers can compute a real duration."""
+        store = InMemoryRunStore()
+        engine = _engine(store, max_attempts=1)
+        # Non-trivial latency so finished_at - started_at is observably > 0.
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=20)
+        await engine.run_one(agent, "q")
+
+        steps = await store.list_steps("run-edge")
+        terminals = [s for s in steps if s.status is StepStatus.SUCCEEDED]
+        assert terminals, "expected at least one SUCCEEDED step record"
+        for step in terminals:
+            assert step.finished_at is not None
+            assert step.started_at <= step.finished_at
+            assert (step.finished_at - step.started_at).total_seconds() > 0.0
+
+    async def test_running_and_terminal_records_share_started_at(self) -> None:
+        """RUNNING and the matching SUCCEEDED record for the same attempt
+        should report the same `started_at`."""
+        store = InMemoryRunStore()
+        engine = _engine(store, max_attempts=1)
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=5)
+        await engine.run_one(agent, "q")
+
+        steps = await store.list_steps("run-edge")
+        running = next(s for s in steps if s.status is StepStatus.RUNNING)
+        succeeded = next(s for s in steps if s.status is StepStatus.SUCCEEDED)
+        assert running.started_at == succeeded.started_at

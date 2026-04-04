@@ -79,6 +79,11 @@ class WorkflowEngine:
         """Execute one agent with the durability semantics above."""
         dedup_key = self._dedup_key(agent, question)
         log = _log.bind(run_id=self.run_id, agent=agent.name.value, dedup_key=dedup_key)
+        # Capture the wall-clock start once. Each StepRecord we write is
+        # stamped with this same `started_at`, so terminal records report
+        # a real `finished_at - started_at` duration instead of stamping
+        # `now()` for both ends.
+        started_at = datetime.now(UTC)
 
         lock = await self._lock_for(dedup_key)
         async with lock:
@@ -91,7 +96,7 @@ class WorkflowEngine:
 
             last_error: str | None = None
             for attempt in range(1, self.config.max_attempts + 1):
-                await self._record(agent, attempt, StepStatus.RUNNING)
+                await self._record(agent, attempt, StepStatus.RUNNING, started_at=started_at)
                 t0 = time.perf_counter()
                 try:
                     result = await asyncio.wait_for(
@@ -101,13 +106,17 @@ class WorkflowEngine:
                     err = AgentTimeoutError(agent.name.value, self.config.per_step_timeout_s)
                     last_error = str(err)
                     log.warning("workflow.timeout", attempt=attempt, timeout_s=err.timeout_s)
-                    await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                    await self._record(
+                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
+                    )
                 except asyncio.CancelledError:
                     # Cooperative cancellation: record the failure, then let the
                     # cancellation propagate so the surrounding task tree unwinds.
                     last_error = "cancelled"
                     log.warning("workflow.cancelled", attempt=attempt)
-                    await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                    await self._record(
+                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
+                    )
                     raise
                 except Exception as exc:  # agents are user code; we wrap in AgentExecutionError
                     wrapped = AgentExecutionError(agent.name.value, exc)
@@ -118,7 +127,9 @@ class WorkflowEngine:
                         exc_type=type(exc).__name__,
                         error=str(exc),
                     )
-                    await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                    await self._record(
+                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
+                    )
                     # Suppress chaining so loggers don't double-report; semantic
                     # info is preserved in `AgentExecutionError.original`.
                     del wrapped
@@ -128,7 +139,9 @@ class WorkflowEngine:
                         final = result.model_copy(
                             update={"attempts": attempt, "elapsed_ms": elapsed}
                         )
-                        await self._record(agent, attempt, StepStatus.SUCCEEDED)
+                        await self._record(
+                            agent, attempt, StepStatus.SUCCEEDED, started_at=started_at
+                        )
                         log.info("workflow.success", attempt=attempt, elapsed_ms=elapsed)
                         if self.cache_put is not None:
                             await self.cache_put(dedup_key, final)
@@ -136,7 +149,9 @@ class WorkflowEngine:
                         return final
                     last_error = result.error or "agent reported FAILED"
                     log.warning("workflow.agent_returned_failed", attempt=attempt, error=last_error)
-                    await self._record(agent, attempt, StepStatus.FAILED, error=last_error)
+                    await self._record(
+                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
+                    )
                 await self._sleep_backoff(attempt)
 
             # All attempts exhausted.
@@ -172,16 +187,21 @@ class WorkflowEngine:
         attempt: int,
         status: StepStatus,
         error: str | None = None,
+        started_at: datetime | None = None,
     ) -> None:
         if self.record_step is None:
             return
+        # Preserve the real start time captured by `run_one` so terminal
+        # records report a positive duration; fall back to `now` only if
+        # a caller invokes `_record` directly without a start time.
+        start = started_at if started_at is not None else datetime.now(UTC)
         await self.record_step(
             StepRecord(
                 run_id=self.run_id,
                 agent=agent.name,
                 status=status,
                 attempts=attempt,
-                started_at=datetime.now(UTC),
+                started_at=start,
                 finished_at=datetime.now(UTC) if status is not StepStatus.RUNNING else None,
                 error=error,
             )

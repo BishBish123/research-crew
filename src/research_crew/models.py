@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentName(StrEnum):
@@ -70,6 +70,16 @@ class ResearchReport(BaseModel):
 class ResearchRequest(BaseModel):
     question: str = Field(min_length=4, max_length=512)
     agents: list[AgentName] | None = None  # default: every agent
+
+    @field_validator("agents")
+    @classmethod
+    def _reject_empty_agents(cls, value: list[AgentName] | None) -> list[AgentName] | None:
+        # `agents=[]` used to silently fall back to the default fan-out,
+        # which masked client bugs. Reject it explicitly so callers either
+        # name the agents they want or omit the field.
+        if value is not None and len(value) == 0:
+            raise ValueError("agents must be non-empty if provided; omit field for default fan-out")
+        return value
 
 
 class RunStatus(BaseModel):

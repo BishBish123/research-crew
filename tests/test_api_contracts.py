@@ -97,6 +97,20 @@ class TestBadPayloads:
         )
         assert resp.status_code == 422
 
+    async def test_empty_agents_list_422s_with_explicit_message(self, client: AsyncClient) -> None:
+        """`agents=[]` is a client bug (used to silently fan-out to
+        defaults). Reject it loudly with a helpful message."""
+        resp = await client.post(
+            "/research",
+            json={"question": "what is python", "agents": []},
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        # FastAPI nests Pydantic validator messages under "detail".
+        rendered = str(body).lower()
+        assert "non-empty" in rendered
+        assert "default fan-out" in rendered
+
 
 class TestStoreUnavailable:
     async def test_health_returns_503_when_redis_missing(self) -> None:

@@ -198,6 +198,64 @@ class TestNoCacheStillRuns:
         assert result.status is StepStatus.SUCCEEDED
 
 
+class TestKeyRegistryCleanup:
+    async def test_cache_put_failure_releases_lock_entry(self) -> None:
+        """If `cache_put` raises mid-flight, the per-key lock registry must
+        not retain the entry. Otherwise a flaky store leaks one lock per
+        failed call and `_key_locks` grows unbounded.
+        """
+        store = InMemoryRunStore()
+
+        class FlakyCache:
+            def __init__(self) -> None:
+                self.real = store
+
+            async def cache_get(self, dedup_key: str) -> AgentResult | None:
+                return await self.real.cache_get(dedup_key)
+
+            async def cache_put(self, dedup_key: str, result: AgentResult) -> None:
+                raise RuntimeError("redis ate it")
+
+        flaky = FlakyCache()
+        engine = WorkflowEngine(
+            run_id="run-edge",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=store.append_step,
+            cache_get=flaky.cache_get,
+            cache_put=flaky.cache_put,
+        )
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
+
+        with pytest.raises(RuntimeError, match="redis ate it"):
+            await engine.run_one(agent, "q")
+
+        # Registry must be empty: the failed key cannot remain pinned.
+        assert engine._key_locks == {}, (
+            f"expected empty lock registry after failure, got {engine._key_locks}"
+        )
+
+    async def test_cache_get_failure_releases_lock_entry(self) -> None:
+        """Same property when the failure is during `cache_get`."""
+        store = InMemoryRunStore()
+
+        async def boom_get(_: str) -> AgentResult | None:
+            raise RuntimeError("get exploded")
+
+        engine = WorkflowEngine(
+            run_id="run-edge",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=store.append_step,
+            cache_get=boom_get,
+            cache_put=store.cache_put,
+        )
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
+
+        with pytest.raises(RuntimeError, match="get exploded"):
+            await engine.run_one(agent, "q")
+
+        assert engine._key_locks == {}
+
+
 class TestStepRecordTimings:
     async def test_terminal_step_preserves_real_started_at(self) -> None:
         """Terminal records must carry the wall-clock start captured at

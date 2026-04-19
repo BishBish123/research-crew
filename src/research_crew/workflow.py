@@ -70,8 +70,10 @@ class WorkflowEngine:
             return lock
 
     async def _release_key(self, dedup_key: str) -> None:
-        # Drop the entry once we've stored a cache result so the registry
-        # doesn't grow unboundedly across long-lived engines.
+        # Drop the entry once the per-key critical section is done so the
+        # registry doesn't grow unboundedly across long-lived engines.
+        # Idempotent: a missing key is a no-op so the `finally` cleanup
+        # path stays safe even if a previous branch already released.
         async with self._registry_lock:
             self._key_locks.pop(dedup_key, None)
 
@@ -87,87 +89,111 @@ class WorkflowEngine:
 
         lock = await self._lock_for(dedup_key)
         async with lock:
-            if self.cache_get is not None:
-                cached = await self.cache_get(dedup_key)
-                if cached is not None:
-                    log.info("workflow.cache_hit")
-                    # Surface the cache-hit so the caller can distinguish.
-                    return cached.model_copy(update={"status": StepStatus.CACHED})
+            # The `finally` guarantees the registry entry is dropped on
+            # every exit path — success, exhausted retries, *and* an
+            # exception bubbling out of cache_get / record_step / cache_put
+            # / agent.search. Without this, a store outage leaks one lock
+            # entry per failed call and the registry grows without bound.
+            try:
+                if self.cache_get is not None:
+                    cached = await self.cache_get(dedup_key)
+                    if cached is not None:
+                        log.info("workflow.cache_hit")
+                        # Surface the cache-hit so the caller can distinguish.
+                        return cached.model_copy(update={"status": StepStatus.CACHED})
 
-            last_error: str | None = None
-            for attempt in range(1, self.config.max_attempts + 1):
-                await self._record(agent, attempt, StepStatus.RUNNING, started_at=started_at)
-                t0 = time.perf_counter()
-                try:
-                    result = await asyncio.wait_for(
-                        agent.search(question), timeout=self.config.per_step_timeout_s
-                    )
-                except TimeoutError:
-                    err = AgentTimeoutError(agent.name.value, self.config.per_step_timeout_s)
-                    last_error = str(err)
-                    log.warning("workflow.timeout", attempt=attempt, timeout_s=err.timeout_s)
-                    await self._record(
-                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
-                    )
-                except asyncio.CancelledError:
-                    # Cooperative cancellation: record the failure, then let the
-                    # cancellation propagate so the surrounding task tree unwinds.
-                    last_error = "cancelled"
-                    log.warning("workflow.cancelled", attempt=attempt)
-                    await self._record(
-                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
-                    )
-                    raise
-                except Exception as exc:  # agents are user code; we wrap in AgentExecutionError
-                    wrapped = AgentExecutionError(agent.name.value, exc)
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    log.warning(
-                        "workflow.agent_error",
-                        attempt=attempt,
-                        exc_type=type(exc).__name__,
-                        error=str(exc),
-                    )
-                    await self._record(
-                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
-                    )
-                    # Suppress chaining so loggers don't double-report; semantic
-                    # info is preserved in `AgentExecutionError.original`.
-                    del wrapped
-                else:
-                    elapsed = (time.perf_counter() - t0) * 1000.0
-                    if result.status is StepStatus.SUCCEEDED:
-                        final = result.model_copy(
-                            update={"attempts": attempt, "elapsed_ms": elapsed}
+                last_error: str | None = None
+                for attempt in range(1, self.config.max_attempts + 1):
+                    await self._record(agent, attempt, StepStatus.RUNNING, started_at=started_at)
+                    t0 = time.perf_counter()
+                    try:
+                        result = await asyncio.wait_for(
+                            agent.search(question), timeout=self.config.per_step_timeout_s
+                        )
+                    except TimeoutError:
+                        err = AgentTimeoutError(agent.name.value, self.config.per_step_timeout_s)
+                        last_error = str(err)
+                        log.warning("workflow.timeout", attempt=attempt, timeout_s=err.timeout_s)
+                        await self._record(
+                            agent,
+                            attempt,
+                            StepStatus.FAILED,
+                            error=last_error,
+                            started_at=started_at,
+                        )
+                    except asyncio.CancelledError:
+                        # Cooperative cancellation: record the failure, then let the
+                        # cancellation propagate so the surrounding task tree unwinds.
+                        last_error = "cancelled"
+                        log.warning("workflow.cancelled", attempt=attempt)
+                        await self._record(
+                            agent,
+                            attempt,
+                            StepStatus.FAILED,
+                            error=last_error,
+                            started_at=started_at,
+                        )
+                        raise
+                    except Exception as exc:  # agents are user code; wrap in AgentExecutionError
+                        wrapped = AgentExecutionError(agent.name.value, exc)
+                        last_error = f"{type(exc).__name__}: {exc}"
+                        log.warning(
+                            "workflow.agent_error",
+                            attempt=attempt,
+                            exc_type=type(exc).__name__,
+                            error=str(exc),
                         )
                         await self._record(
-                            agent, attempt, StepStatus.SUCCEEDED, started_at=started_at
+                            agent,
+                            attempt,
+                            StepStatus.FAILED,
+                            error=last_error,
+                            started_at=started_at,
                         )
-                        log.info("workflow.success", attempt=attempt, elapsed_ms=elapsed)
-                        if self.cache_put is not None:
-                            await self.cache_put(dedup_key, final)
-                        await self._release_key(dedup_key)
-                        return final
-                    last_error = result.error or "agent reported FAILED"
-                    log.warning("workflow.agent_returned_failed", attempt=attempt, error=last_error)
-                    await self._record(
-                        agent, attempt, StepStatus.FAILED, error=last_error, started_at=started_at
-                    )
-                await self._sleep_backoff(attempt)
+                        # Suppress chaining so loggers don't double-report; semantic
+                        # info is preserved in `AgentExecutionError.original`.
+                        del wrapped
+                    else:
+                        elapsed = (time.perf_counter() - t0) * 1000.0
+                        if result.status is StepStatus.SUCCEEDED:
+                            final = result.model_copy(
+                                update={"attempts": attempt, "elapsed_ms": elapsed}
+                            )
+                            await self._record(
+                                agent, attempt, StepStatus.SUCCEEDED, started_at=started_at
+                            )
+                            log.info("workflow.success", attempt=attempt, elapsed_ms=elapsed)
+                            if self.cache_put is not None:
+                                await self.cache_put(dedup_key, final)
+                            return final
+                        last_error = result.error or "agent reported FAILED"
+                        log.warning(
+                            "workflow.agent_returned_failed", attempt=attempt, error=last_error
+                        )
+                        await self._record(
+                            agent,
+                            attempt,
+                            StepStatus.FAILED,
+                            error=last_error,
+                            started_at=started_at,
+                        )
+                    await self._sleep_backoff(attempt)
 
-            # All attempts exhausted.
-            log.warning(
-                "workflow.exhausted",
-                attempts=self.config.max_attempts,
-                last_error=last_error,
-            )
-            await self._release_key(dedup_key)
-            return AgentResult(
-                agent=agent.name,
-                status=StepStatus.FAILED,
-                summary="",
-                error=last_error or "exhausted retries",
-                attempts=self.config.max_attempts,
-            )
+                # All attempts exhausted.
+                log.warning(
+                    "workflow.exhausted",
+                    attempts=self.config.max_attempts,
+                    last_error=last_error,
+                )
+                return AgentResult(
+                    agent=agent.name,
+                    status=StepStatus.FAILED,
+                    summary="",
+                    error=last_error or "exhausted retries",
+                    attempts=self.config.max_attempts,
+                )
+            finally:
+                await self._release_key(dedup_key)
 
     async def run_parallel(self, agents: list[Agent], question: str) -> list[AgentResult]:
         """Fan out to every agent concurrently. Partial failure does not abort."""

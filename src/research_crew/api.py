@@ -43,11 +43,19 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     Tests can override `app_.state.redis` / `app_.state.store` *before*
     issuing requests because the lifespan sees ``getattr(..., None)`` and
     only initialises what's missing.
+
+    Also initialises the in-process terminal-state shadow cache: when the
+    store rejects a terminal-state write from the background task (the
+    whole point of that path is "store is down"), the bg task stashes the
+    final RunStatus here so a subsequent `GET /runs/{run_id}` can still
+    surface a terminal state instead of "running forever".
     """
     if getattr(app_.state, "redis", None) is None:
         client = aioredis.from_url(_redis_url(), decode_responses=True)
         app_.state.redis = client
         app_.state.store = RedisRunStore(client)
+    if getattr(app_.state, "terminal_shadow", None) is None:
+        app_.state.terminal_shadow = {}
     try:
         yield
     finally:
@@ -100,20 +108,68 @@ async def submit_research(
         _log.warning("api.store_down_on_submit", run_id=run_id, error=str(exc))
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
     _log.info("api.run_submitted", run_id=run_id, question_len=len(payload.question))
-    background.add_task(_execute_run, store, run_id, payload)
+    background.add_task(_execute_run, store, _terminal_shadow(request), run_id, payload)
     return {"run_id": run_id, "status_url": f"/runs/{run_id}"}
+
+
+_TERMINAL_STATES = (StepStatus.SUCCEEDED, StepStatus.FAILED)
+
+
+def _terminal_shadow(request: Request) -> dict[str, RunStatus]:
+    shadow: dict[str, RunStatus] | None = getattr(
+        request.app.state, "terminal_shadow", None
+    )
+    if shadow is None:
+        # Lifespan didn't run (some tests poke app.state directly); make
+        # the shadow lookup a no-op rather than crash on missing attr.
+        shadow = {}
+        request.app.state.terminal_shadow = shadow
+    return shadow
 
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> RunStatus:
+    """Return the latest known state for `run_id`.
+
+    Lookup precedence (the shadow exists for the bg-task store-outage path
+    where the run *did* finish but the store rejected our terminal write):
+
+    1. Store has a terminal record (SUCCEEDED/FAILED) → return it.
+    2. Store has a still-RUNNING record but the shadow has a terminal one
+       → return the shadow (the bg task hit a store outage and recovered
+       to in-process state, while a stale RUNNING blob lingers in Redis).
+    3. Store says 404 but the shadow has it → return the shadow.
+    4. Store outage → return the shadow if present, else 503.
+    """
     store = _store(request)
+    shadow = _terminal_shadow(request)
     try:
         run = await store.get_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    except (StoreUnavailableError, RedisError) as exc:
+        shadow_run = shadow.get(run_id)
+        if shadow_run is not None:
+            _log.info("api.get_run_served_from_shadow_on_outage", run_id=run_id)
+            return shadow_run
+        _log.warning("api.store_down_on_get", run_id=run_id, error=str(exc))
+        raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
+
+    if run is None:
+        shadow_run = shadow.get(run_id)
+        if shadow_run is not None:
+            _log.info("api.get_run_served_from_shadow_on_404", run_id=run_id)
+            return shadow_run
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+
+    if run.state not in _TERMINAL_STATES:
+        shadow_run = shadow.get(run_id)
+        if shadow_run is not None:
+            _log.info("api.get_run_shadow_overrides_running", run_id=run_id)
+            return shadow_run
+
+    try:
         run.steps = await store.list_steps(run_id)
     except (StoreUnavailableError, RedisError) as exc:
-        _log.warning("api.store_down_on_get", run_id=run_id, error=str(exc))
+        _log.warning("api.store_down_on_list_steps", run_id=run_id, error=str(exc))
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
     return run
 
@@ -123,13 +179,48 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
 # ---------------------------------------------------------------------------
 
 
-async def _execute_run(store: RunStore, run_id: str, payload: ResearchRequest) -> None:
+async def _persist_terminal(
+    store: RunStore,
+    shadow: dict[str, RunStatus],
+    run: RunStatus,
+    *,
+    agent_label: str,
+) -> None:
+    """Write a terminal RunStatus to the store; on failure stash in the
+    in-process shadow so a subsequent GET still surfaces a terminal state.
+
+    The shadow is only written on the failure path. A successful put
+    leaves `shadow[run_id]` untouched so happy-path runs never pollute
+    the in-process cache.
+    """
+    try:
+        await store.put_run(run)
+    except Exception as exc:
+        _log.error(
+            "api.background_terminal_write_failed",
+            run_id=run.run_id,
+            agent=agent_label,
+            exc_type=type(exc).__name__,
+            error=str(exc),
+        )
+        shadow[run.run_id] = run
+
+
+async def _execute_run(
+    store: RunStore,
+    shadow: dict[str, RunStatus],
+    run_id: str,
+    payload: ResearchRequest,
+) -> None:
     """Run the workflow and persist the terminal state.
 
     Wrapped so any uncaught failure (workflow bug, store outage,
     synthesizer crash) leaves the run in a terminal FAILED state with
-    an error message instead of stuck at `running` forever. If the
-    store itself is also down the best we can do is log loudly.
+    an error message instead of stuck at `running` forever. When the
+    store itself is the cause of the outage, the terminal RunStatus is
+    written to the in-process `shadow` cache so `GET /runs/{id}` can
+    still report a terminal state — the next-best thing to a durable
+    write.
     """
     try:
         agents = default_agents()
@@ -156,7 +247,7 @@ async def _execute_run(store: RunStore, run_id: str, payload: ResearchRequest) -
         )
         finished.finished_at = datetime.now(UTC)
         finished.report = report
-        await store.put_run(finished)
+        await _persist_terminal(store, shadow, finished, agent_label="workflow_done")
     except Exception as exc:
         _log.error(
             "api.background_run_failed",
@@ -165,20 +256,31 @@ async def _execute_run(store: RunStore, run_id: str, payload: ResearchRequest) -
             error=str(exc),
         )
         # Best-effort: mark the run FAILED so callers see a terminal state.
-        # If the store itself is the cause of the outage, this will also
-        # raise and the loud `error` log above is the only signal.
+        # If the store itself is the cause of the outage, both the read
+        # and the write may raise — fall back to the in-process shadow
+        # so the GET path can still surface FAILED.
         try:
             existing = await store.get_run(run_id)
-            if existing is not None:
-                existing.state = StepStatus.FAILED
-                existing.finished_at = datetime.now(UTC)
-                await store.put_run(existing)
         except Exception as recovery_exc:
             _log.error(
-                "api.background_failed_state_unrecorded",
+                "api.background_failed_state_read_failed",
                 run_id=run_id,
+                exc_type=type(recovery_exc).__name__,
                 error=str(recovery_exc),
             )
+            existing = None
+
+        # Build the FAILED RunStatus to record. If we couldn't even read
+        # the original record, synthesise a minimal one from what we know
+        # so the shadow still has a terminal entry to serve.
+        failed = existing if existing is not None else RunStatus(
+            run_id=run_id,
+            question=payload.question,
+            state=StepStatus.RUNNING,
+        )
+        failed.state = StepStatus.FAILED
+        failed.finished_at = datetime.now(UTC)
+        await _persist_terminal(store, shadow, failed, agent_label="workflow_failed")
 
 
 # ---------------------------------------------------------------------------

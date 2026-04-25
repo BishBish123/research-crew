@@ -1020,8 +1020,31 @@ async def _persist_terminal(
 
     A successful put leaves `shadow[run_id]` untouched so happy-path
     runs never pollute the in-process cache.
+
+    TOCTOU note: ``store.put_run`` is a blind write, so a parallel
+    finaliser that already persisted a terminal record can be
+    overwritten here. Re-read once just before the put and skip the
+    write if the stored record is already terminal — narrow but
+    cheap. We can't make this fully race-free without a CAS in the
+    store layer, but the re-read closes the window for the common
+    case (synthesised-FAILED finalisation racing with a regular
+    finalisation).
     """
     try:
+        existing = None
+        with contextlib.suppress(StoreUnavailableError, RedisError):
+            existing = await store.get_run(run.run_id)
+        if existing is not None and existing.state in {
+            StepStatus.SUCCEEDED,
+            StepStatus.FAILED,
+        }:
+            _log.info(
+                "api.background_terminal_write_skipped_already_terminal",
+                run_id=run.run_id,
+                agent=agent_label,
+                existing_state=existing.state.value,
+            )
+            return
         await store.put_run(run)
     except (StoreUnavailableError, RedisError) as exc:
         _log.error(

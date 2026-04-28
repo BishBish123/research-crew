@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
@@ -32,6 +33,68 @@ from research_crew.workflow import WorkflowEngine
 _log = structlog.get_logger(__name__)
 
 
+# Default ceiling on the in-process terminal-state shadow. The shadow only
+# accumulates entries while the run store is unavailable, so 10k is many
+# orders of magnitude more than a typical degraded-mode window. Operators
+# can override via the RESEARCH_SHADOW_MAX env var.
+_DEFAULT_SHADOW_MAX = 10_000
+
+
+class _TerminalShadow:
+    """Bounded FIFO shadow of terminal RunStatuses.
+
+    Used only on the bg-task store-outage path. Behaves like a `dict` for
+    the read sites but evicts the oldest entry on insert once `max_size`
+    is exceeded — without this cap, a long store outage with continuous
+    submits would grow the process heap unboundedly.
+
+    Concurrency note: shadow reads (GET handler) and shadow writes (bg
+    task) both run in the same event loop, so dict mutations are not
+    interleaved at the bytecode level. No explicit lock is needed.
+    """
+
+    def __init__(self, max_size: int = _DEFAULT_SHADOW_MAX) -> None:
+        if max_size <= 0:
+            raise ValueError("max_size must be positive")
+        self._items: OrderedDict[str, RunStatus] = OrderedDict()
+        self._max_size = max_size
+
+    def __setitem__(self, run_id: str, run: RunStatus) -> None:
+        if run_id in self._items:
+            # Refresh insertion order so the newest write is the youngest.
+            self._items.move_to_end(run_id)
+        self._items[run_id] = run
+        while len(self._items) > self._max_size:
+            evicted_id, _ = self._items.popitem(last=False)
+            _log.warning(
+                "api.terminal_shadow_evicted",
+                run_id=evicted_id,
+                max_size=self._max_size,
+                reason="shadow_full",
+            )
+
+    def __getitem__(self, run_id: str) -> RunStatus:
+        return self._items[run_id]
+
+    def __contains__(self, run_id: object) -> bool:
+        return run_id in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def get(self, run_id: str, default: RunStatus | None = None) -> RunStatus | None:
+        return self._items.get(run_id, default)
+
+    def pop(self, run_id: str, default: RunStatus | None = None) -> RunStatus | None:
+        return self._items.pop(run_id, default)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
 def _redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
@@ -55,7 +118,9 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
         app_.state.redis = client
         app_.state.store = RedisRunStore(client)
     if getattr(app_.state, "terminal_shadow", None) is None:
-        app_.state.terminal_shadow = {}
+        app_.state.terminal_shadow = _TerminalShadow(
+            max_size=int(os.environ.get("RESEARCH_SHADOW_MAX", _DEFAULT_SHADOW_MAX))
+        )
     try:
         yield
     finally:
@@ -115,14 +180,12 @@ async def submit_research(
 _TERMINAL_STATES = (StepStatus.SUCCEEDED, StepStatus.FAILED)
 
 
-def _terminal_shadow(request: Request) -> dict[str, RunStatus]:
-    shadow: dict[str, RunStatus] | None = getattr(
-        request.app.state, "terminal_shadow", None
-    )
+def _terminal_shadow(request: Request) -> _TerminalShadow:
+    shadow: _TerminalShadow | None = getattr(request.app.state, "terminal_shadow", None)
     if shadow is None:
         # Lifespan didn't run (some tests poke app.state directly); make
         # the shadow lookup a no-op rather than crash on missing attr.
-        shadow = {}
+        shadow = _TerminalShadow()
         request.app.state.terminal_shadow = shadow
     return shadow
 
@@ -181,7 +244,7 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
 
 async def _persist_terminal(
     store: RunStore,
-    shadow: dict[str, RunStatus],
+    shadow: _TerminalShadow,
     run: RunStatus,
     *,
     agent_label: str,
@@ -208,7 +271,7 @@ async def _persist_terminal(
 
 async def _execute_run(
     store: RunStore,
-    shadow: dict[str, RunStatus],
+    shadow: _TerminalShadow,
     run_id: str,
     payload: ResearchRequest,
 ) -> None:

@@ -265,3 +265,65 @@ class TestShadowDoesNotPolluteOnSuccess:
         assert body["state"] == "succeeded"
         # Shadow remained empty for this run id.
         assert run_id not in app.state.terminal_shadow
+
+
+class TestShadowBounded:
+    """The shadow MUST cap memory growth — a long store outage with a
+    steady submit rate would otherwise leak entries forever.
+    """
+
+    def test_oldest_entry_evicted_when_capacity_exceeded(self) -> None:
+        from research_crew.api import _TerminalShadow
+
+        shadow = _TerminalShadow(max_size=3)
+        runs = [
+            RunStatus(run_id=f"r{i}", question="q", state=StepStatus.FAILED)
+            for i in range(5)
+        ]
+        for run in runs:
+            shadow[run.run_id] = run
+
+        # Capacity is 3, we wrote 5 → r0 and r1 evicted (FIFO).
+        assert len(shadow) == 3
+        assert "r0" not in shadow
+        assert "r1" not in shadow
+        assert "r2" in shadow
+        assert "r3" in shadow
+        assert "r4" in shadow
+
+    def test_reinsert_refreshes_recency(self) -> None:
+        from research_crew.api import _TerminalShadow
+
+        shadow = _TerminalShadow(max_size=2)
+        a = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)
+        b = RunStatus(run_id="b", question="q", state=StepStatus.FAILED)
+        c = RunStatus(run_id="c", question="q", state=StepStatus.FAILED)
+
+        shadow["a"] = a
+        shadow["b"] = b
+        # Re-write a → it becomes the youngest, so the next eviction drops b.
+        shadow["a"] = a
+        shadow["c"] = c
+
+        assert "a" in shadow
+        assert "c" in shadow
+        assert "b" not in shadow
+
+    def test_max_size_must_be_positive(self) -> None:
+        from research_crew.api import _TerminalShadow
+
+        with pytest.raises(ValueError):
+            _TerminalShadow(max_size=0)
+        with pytest.raises(ValueError):
+            _TerminalShadow(max_size=-1)
+
+    def test_clear_resets_to_empty(self) -> None:
+        from research_crew.api import _TerminalShadow
+
+        shadow = _TerminalShadow(max_size=10)
+        shadow["a"] = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)
+        shadow["b"] = RunStatus(run_id="b", question="q", state=StepStatus.FAILED)
+        assert len(shadow) == 2
+        shadow.clear()
+        assert len(shadow) == 0
+        assert "a" not in shadow

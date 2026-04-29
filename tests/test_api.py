@@ -18,6 +18,10 @@ async def client() -> AsyncIterator[AsyncClient]:
     fake = fake_aioredis.FakeRedis(decode_responses=True)
     app.state.redis = fake
     app.state.store = RedisRunStore(fake)
+    # Reset shadow between tests; otherwise a prior test that primed it
+    # could mask a real regression in shadow-population code paths here.
+    if hasattr(app.state, "terminal_shadow") and hasattr(app.state.terminal_shadow, "clear"):
+        app.state.terminal_shadow.clear()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://t") as c:
         yield c

@@ -15,7 +15,7 @@ import fakeredis.aioredis as fake_aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from research_crew.api import app
+from research_crew.api import _TerminalShadow, app
 from research_crew.errors import StoreUnavailableError
 from research_crew.models import AgentResult, RunStatus, StepRecord, StepStatus
 from research_crew.store import RedisRunStore, RunStore
@@ -79,8 +79,9 @@ async def shadow_client() -> AsyncIterator[tuple[AsyncClient, _SelectiveFailStor
     app.state.redis = fake
     app.state.store = selective
     # Reset shadow per-test so isolation is real, not an artefact of
-    # whichever test happened to run first.
-    app.state.terminal_shadow = {}
+    # whichever test happened to run first. Use the production-shape
+    # bounded shadow so eviction-aware code paths run in tests too.
+    app.state.terminal_shadow = _TerminalShadow()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://t") as c:
         yield c, selective
@@ -112,13 +113,16 @@ class TestShadowOnTerminalWriteFailure:
         # the shadow already holds the terminal record. A single GET is
         # enough; poll only as a guard against future scheduler changes.
         body: dict[str, object] = {}
+        last_status = -1
         for _ in range(20):
             r = await client.get(f"/runs/{run_id}")
+            last_status = r.status_code
             body = r.json()
             if body.get("state") in ("succeeded", "failed"):
                 break
         # Even though the terminal `put_run` failed, the shadow served a
         # terminal state to the GET caller — not "running forever".
+        assert last_status == 200, f"expected 200 from shadow lookup, got {last_status}"
         assert body["state"] in {"succeeded", "failed"}
         assert body["run_id"] == run_id
         # Shadow should contain exactly this run.
@@ -143,11 +147,14 @@ class TestShadowOnTerminalWriteFailure:
         run_id: str = resp.json()["run_id"]
 
         body: dict[str, object] = {}
+        last_status = -1
         for _ in range(20):
             r = await client.get(f"/runs/{run_id}")
+            last_status = r.status_code
             body = r.json()
             if body.get("state") in ("succeeded", "failed"):
                 break
+        assert last_status == 200, f"expected 200 from shadow lookup, got {last_status}"
         assert body["state"] == "failed"
         # Shadow holds the FAILED RunStatus the bg task synthesised.
         shadow_entry = app.state.terminal_shadow[run_id]
@@ -257,11 +264,14 @@ class TestShadowDoesNotPolluteOnSuccess:
 
         # Drive the run to terminal state via polling.
         body: dict[str, object] = {}
+        last_status = -1
         for _ in range(40):
             r = await client.get(f"/runs/{run_id}")
+            last_status = r.status_code
             body = r.json()
             if body.get("state") in ("succeeded", "failed"):
                 break
+        assert last_status == 200, f"expected 200 from happy path, got {last_status}"
         assert body["state"] == "succeeded"
         # Shadow remained empty for this run id.
         assert run_id not in app.state.terminal_shadow
@@ -273,7 +283,7 @@ class TestShadowBounded:
     """
 
     def test_oldest_entry_evicted_when_capacity_exceeded(self) -> None:
-        from research_crew.api import _TerminalShadow
+
 
         shadow = _TerminalShadow(max_size=3)
         runs = [
@@ -292,7 +302,7 @@ class TestShadowBounded:
         assert "r4" in shadow
 
     def test_reinsert_refreshes_recency(self) -> None:
-        from research_crew.api import _TerminalShadow
+
 
         shadow = _TerminalShadow(max_size=2)
         a = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)
@@ -310,7 +320,7 @@ class TestShadowBounded:
         assert "b" not in shadow
 
     def test_max_size_must_be_positive(self) -> None:
-        from research_crew.api import _TerminalShadow
+
 
         with pytest.raises(ValueError):
             _TerminalShadow(max_size=0)
@@ -318,7 +328,7 @@ class TestShadowBounded:
             _TerminalShadow(max_size=-1)
 
     def test_clear_resets_to_empty(self) -> None:
-        from research_crew.api import _TerminalShadow
+
 
         shadow = _TerminalShadow(max_size=10)
         shadow["a"] = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)

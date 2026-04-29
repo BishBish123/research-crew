@@ -20,6 +20,11 @@ async def client() -> AsyncIterator[AsyncClient]:
     fake = fake_aioredis.FakeRedis(decode_responses=True)
     app.state.redis = fake
     app.state.store = RedisRunStore(fake)
+    # Reset the terminal-state shadow per-test so cross-module state
+    # never leaks between fixtures (prior write from another test could
+    # otherwise satisfy a `not in shadow` assertion vacuously).
+    if hasattr(app.state, "terminal_shadow") and hasattr(app.state.terminal_shadow, "clear"):
+        app.state.terminal_shadow.clear()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://t") as c:
         yield c

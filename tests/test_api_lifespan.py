@@ -315,9 +315,7 @@ class TestHeartbeatLoop:
 
         # Run the loop with a tiny interval; it must observe SUCCEEDED
         # and return cleanly without raising.
-        await asyncio.wait_for(
-            _heartbeat_loop(store, "hb-done", interval_s=0.01), timeout=0.5
-        )
+        await asyncio.wait_for(_heartbeat_loop(store, "hb-done", interval_s=0.01), timeout=0.5)
 
         unchanged = await store.get_run("hb-done")
         assert unchanged is not None
@@ -354,9 +352,7 @@ class TestExecuteRunCancellation:
         # `asyncio.sleep`-based "hopefully it started" race.
         started: asyncio.Event = asyncio.Event()
 
-        async def _stub_run_parallel(
-            self: object, agents: object, question: object
-        ) -> object:
+        async def _stub_run_parallel(self: object, agents: object, question: object) -> object:
             started.set()
             # Block until cancelled by the outer test cancellation.
             await asyncio.Event().wait()
@@ -368,7 +364,9 @@ class TestExecuteRunCancellation:
 
         async def _go() -> None:
             await _execute_run(
-                store, shadow, "cancel-me",
+                store,
+                shadow,
+                "cancel-me",
                 ResearchRequest(question="what is python"),
             )
 

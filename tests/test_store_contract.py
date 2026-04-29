@@ -178,9 +178,7 @@ class TestRedisKeyPrefix:
         try:
             store = RedisRunStore(fake)
             await store.put_run(_run())
-            await store.append_step(
-                _step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED)
-            )
+            await store.append_step(_step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED))
             await store.cache_put(
                 "step:abc",
                 AgentResult(
@@ -207,9 +205,7 @@ class TestRedisKeyPrefix:
             got = await store.get_run("r-1")
             assert got is not None and got.run_id == "r-1"
 
-            await store.append_step(
-                _step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED)
-            )
+            await store.append_step(_step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED))
             steps = await store.list_steps("r-1")
             assert len(steps) == 1
 

@@ -96,7 +96,7 @@ class RedisRunStore:
         # The workflow engine already prepends ``step:`` to dedup_key;
         # collapse that into the prefixed namespace so the on-disk key
         # is `{prefix}:step:{digest}` not `{prefix}:step:step:{digest}`.
-        tail = dedup_key[len("step:"):] if dedup_key.startswith("step:") else dedup_key
+        tail = dedup_key[len("step:") :] if dedup_key.startswith("step:") else dedup_key
         return f"{self._prefix}:step:{tail}"
 
     async def get_run(self, run_id: str) -> RunStatus | None:
@@ -187,9 +187,10 @@ class RedisRunStore:
             try:
                 await pipe.watch(key)
                 raw = await pipe.get(key)
-                if raw is None or self._cas_matches(
-                    raw, key, expected_state, expected_heartbeat_at
-                ) is None:
+                if (
+                    raw is None
+                    or self._cas_matches(raw, key, expected_state, expected_heartbeat_at) is None
+                ):
                     await pipe.reset()  # type: ignore[no-untyped-call]
                     return False
                 # State and heartbeat match — attempt the atomic write.

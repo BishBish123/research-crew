@@ -230,9 +230,7 @@ class WorkflowEngine:
             else:
                 elapsed = (time.perf_counter() - t0) * 1000.0
                 if result.status is StepStatus.SUCCEEDED:
-                    final = result.model_copy(
-                        update={"attempts": attempt, "elapsed_ms": elapsed}
-                    )
+                    final = result.model_copy(update={"attempts": attempt, "elapsed_ms": elapsed})
                     await self._safe_record(
                         agent,
                         attempt,
@@ -244,9 +242,7 @@ class WorkflowEngine:
                     await self._safe_cache_put(dedup_key, final, log)
                     return final
                 last_error = result.error or "agent reported FAILED"
-                log.warning(
-                    "workflow.agent_returned_failed", attempt=attempt, error=last_error
-                )
+                log.warning("workflow.agent_returned_failed", attempt=attempt, error=last_error)
                 await self._safe_record(
                     agent,
                     attempt,

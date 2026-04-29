@@ -113,9 +113,7 @@ class TestAuthEnforced:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    async def test_auth_accepts_lowercase_bearer_scheme(
-        self, auth_client: AsyncClient
-    ) -> None:
+    async def test_auth_accepts_lowercase_bearer_scheme(self, auth_client: AsyncClient) -> None:
         """Scheme comparison is case-insensitive: `bearer`, `Bearer`,
         and `BEARER` must all be accepted when the token is correct.
 
@@ -170,8 +168,7 @@ class TestOpenApiSecurityScheme:
             # Security scheme is declared.
             schemes = spec.get("components", {}).get("securitySchemes", {})
             assert any(
-                s.get("type") == "http" and s.get("scheme") == "bearer"
-                for s in schemes.values()
+                s.get("type") == "http" and s.get("scheme") == "bearer" for s in schemes.values()
             ), f"expected an HTTP bearer security scheme; got {schemes}"
 
             # 401 response is documented on /research and /runs/{run_id}.
@@ -197,8 +194,7 @@ class TestOpenApiSecurityScheme:
             spec = r.json()
             schemes = spec.get("components", {}).get("securitySchemes", {})
             assert not any(
-                s.get("type") == "http" and s.get("scheme") == "bearer"
-                for s in schemes.values()
+                s.get("type") == "http" and s.get("scheme") == "bearer" for s in schemes.values()
             ), f"expected no HTTP bearer security scheme when token unset; got {schemes}"
         finally:
             app.openapi_schema = None  # type: ignore[assignment]
@@ -337,9 +333,7 @@ class TestTrustedProxyXFF:
     spoof the header to dodge the per-IP cap.
     """
 
-    async def test_rate_limit_uses_xff_when_proxy_trusted(
-        self, open_client: AsyncClient
-    ) -> None:
+    async def test_rate_limit_uses_xff_when_proxy_trusted(self, open_client: AsyncClient) -> None:
         # A tight limiter so we can prove two distinct client IPs each
         # get their own bucket *through* the same trusted proxy.
         app.state.rate_limiter = _RateLimiter(limit_per_min=1)

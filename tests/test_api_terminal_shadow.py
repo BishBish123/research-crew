@@ -426,12 +426,8 @@ class TestShadowBounded:
 
     def test_oldest_entry_evicted_when_capacity_exceeded(self) -> None:
 
-
         shadow = _TerminalShadow(max_size=3)
-        runs = [
-            RunStatus(run_id=f"r{i}", question="q", state=StepStatus.FAILED)
-            for i in range(5)
-        ]
+        runs = [RunStatus(run_id=f"r{i}", question="q", state=StepStatus.FAILED) for i in range(5)]
         for run in runs:
             shadow[run.run_id] = run
 
@@ -444,7 +440,6 @@ class TestShadowBounded:
         assert "r4" in shadow
 
     def test_reinsert_refreshes_recency(self) -> None:
-
 
         shadow = _TerminalShadow(max_size=2)
         a = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)
@@ -463,14 +458,12 @@ class TestShadowBounded:
 
     def test_max_size_must_be_positive(self) -> None:
 
-
         with pytest.raises(ValueError):
             _TerminalShadow(max_size=0)
         with pytest.raises(ValueError):
             _TerminalShadow(max_size=-1)
 
     def test_clear_resets_to_empty(self) -> None:
-
 
         shadow = _TerminalShadow(max_size=10)
         shadow["a"] = RunStatus(run_id="a", question="q", state=StepStatus.FAILED)

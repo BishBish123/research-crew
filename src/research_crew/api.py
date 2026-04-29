@@ -283,9 +283,7 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
         # one Redis without cross-talk; defaults to "research" via the
         # store constructor.
         prefix = os.environ.get("RESEARCH_REDIS_PREFIX", "").strip()
-        app_.state.store = (
-            RedisRunStore(client, prefix=prefix) if prefix else RedisRunStore(client)
-        )
+        app_.state.store = RedisRunStore(client, prefix=prefix) if prefix else RedisRunStore(client)
     if getattr(app_.state, "terminal_shadow", None) is None:
         app_.state.terminal_shadow = _TerminalShadow(
             max_size=int(os.environ.get("RESEARCH_SHADOW_MAX", _DEFAULT_SHADOW_MAX))
@@ -317,9 +315,7 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     # is unset we use the conservative default. Recreate per lifespan
     # so `make api && CTRL+C && make api` doesn't carry counters across
     # the (logical) restart.
-    rate_per_min = int(
-        os.environ.get("RESEARCH_RATE_LIMIT_PER_MIN", _DEFAULT_RATE_LIMIT_PER_MIN)
-    )
+    rate_per_min = int(os.environ.get("RESEARCH_RATE_LIMIT_PER_MIN", _DEFAULT_RATE_LIMIT_PER_MIN))
     app_.state.rate_limiter = _RateLimiter(limit_per_min=rate_per_min)
     # Trusted-proxy set for X-Forwarded-For honouring. CSV of bare IPs
     # (CIDR is intentionally NOT supported here — keeping the surface
@@ -449,9 +445,7 @@ async def _reconcile_one(
     return "reconciled"
 
 
-async def _load_running_run(
-    redis_client: aioredis.Redis, key: str
-) -> RunStatus | None:
+async def _load_running_run(redis_client: aioredis.Redis, key: str) -> RunStatus | None:
     """Read + parse a RUNNING blob; return ``None`` for any reason it
     isn't a candidate (transient read error, missing, terminal,
     unparseable, version too new, or state not actually RUNNING).
@@ -482,9 +476,7 @@ async def _load_running_run(
     return run if run.state is StepStatus.RUNNING else None
 
 
-def _abandonment_reason(
-    run: RunStatus, *, now: datetime, stale_after_s: int
-) -> str | None:
+def _abandonment_reason(run: RunStatus, *, now: datetime, stale_after_s: int) -> str | None:
     """Decide whether a RUNNING run should be flipped to FAILED.
 
     Returns the human-readable abandonment reason, or ``None`` if the
@@ -953,9 +945,7 @@ async def get_run(
     return run
 
 
-async def _hydrate_steps_best_effort(
-    store: RunStore, run_id: str, run: RunStatus
-) -> RunStatus:
+async def _hydrate_steps_best_effort(store: RunStore, run_id: str, run: RunStatus) -> RunStatus:
     """When serving from the shadow, try once to populate `steps` from
     the store. If the store is unreachable (the same outage that drove
     us to the shadow in the first place), log and return the shadow as
@@ -1094,9 +1084,7 @@ async def _run_workflow_and_persist(
     results = await engine.run_parallel(agents, payload.question)
     succeeded_agents = sum(1 for r in results if r.status is not StepStatus.FAILED)
     failed_agents = sum(1 for r in results if r.status is StepStatus.FAILED)
-    report: ResearchReport = await StitchSynthesizer().synthesize(
-        run_id, payload.question, results
-    )
+    report: ResearchReport = await StitchSynthesizer().synthesize(run_id, payload.question, results)
     await _stop_task(heartbeat_task)
     finished = await store.get_run(run_id)
     if finished is None:
@@ -1217,10 +1205,14 @@ async def _execute_run(
         # Build the FAILED RunStatus to record. If we couldn't even read
         # the original record, synthesise a minimal one from what we know
         # so the shadow still has a terminal entry to serve.
-        failed = existing if existing is not None else RunStatus(
-            run_id=run_id,
-            question=payload.question,
-            state=StepStatus.RUNNING,
+        failed = (
+            existing
+            if existing is not None
+            else RunStatus(
+                run_id=run_id,
+                question=payload.question,
+                state=StepStatus.RUNNING,
+            )
         )
         failed.state = StepStatus.FAILED
         failed.finished_at = datetime.now(UTC)

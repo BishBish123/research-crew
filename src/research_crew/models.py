@@ -161,9 +161,7 @@ class ResearchRequest(BaseModel):
         if len(value) == 0:
             raise ValueError("agents must be non-empty if provided; omit field for default fan-out")
         if len(value) > _MAX_AGENTS_PER_REQUEST:
-            raise ValueError(
-                f"agents list exceeds max of {_MAX_AGENTS_PER_REQUEST} entries"
-            )
+            raise ValueError(f"agents list exceeds max of {_MAX_AGENTS_PER_REQUEST} entries")
         return value
 
 

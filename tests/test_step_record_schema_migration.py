@@ -110,9 +110,7 @@ class TestStepRecordV1ToCurrentMigration:
             await fake.rpush(_STEPS_KEY, json.dumps(future_blob))
 
             steps = await store.list_steps(_RUN_ID)
-            assert steps == [], (
-                f"future-version blob must be dropped; got {steps}"
-            )
+            assert steps == [], f"future-version blob must be dropped; got {steps}"
         finally:
             await fake.aclose()
 

@@ -274,9 +274,9 @@ make load   # opens Locust on http://localhost:8089
 ## Tests
 
 ```bash
-make test                # 192 unit tests (workflow, synthesizer, store, API, agents, properties)
-make test-integration    # tests gated on a real Redis at $REDIS_URL (no-op if none collected)
-make check               # ruff + mypy --strict
+make test                # unit tests (workflow, synthesizer, store, API, agents, properties)
+make test-integration    # placeholder for future integration tests; currently 0 collected
+make check               # ruff check + ruff format --check + mypy --strict (matches CI)
 ```
 
 What's covered today:

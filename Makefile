@@ -23,18 +23,22 @@ lint: ## Lint with ruff
 typecheck: ## mypy --strict
 	$(UV) run mypy src
 
+.PHONY: format-check
+format-check: ## Verify ruff format would not rewrite anything (CI gate)
+	$(UV) run ruff format --check src tests
+
 .PHONY: check
-check: lint typecheck
+check: lint format-check typecheck
 
 .PHONY: test
 test: ## Unit tests
 	$(UV) run pytest -m "not integration"
 
 .PHONY: test-integration
-test-integration: ## Integration (needs Redis)
+test-integration: ## Placeholder for future @pytest.mark.integration tests (currently 0)
 	@$(UV) run pytest -m integration; status=$$?; \
 		if [ $$status -eq 5 ]; then \
-			echo "no integration tests collected — skipping"; \
+			echo "no integration tests collected — placeholder target until real ones land"; \
 			exit 0; \
 		fi; \
 		exit $$status

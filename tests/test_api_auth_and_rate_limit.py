@@ -450,6 +450,48 @@ class TestTrustedProxyXFF:
         finally:
             app.state.trusted_proxies = set()
 
+    async def test_xff_multi_hop_prefers_rightmost_untrusted_hop(
+        self, open_client: AsyncClient
+    ) -> None:
+        """RTL walk regression: a malicious client prepends spoofed
+        XFF entries; the trusted proxy appends the real client IP at
+        the END. The limiter MUST take the rightmost untrusted hop
+        (the proxy's observation) and ignore the attacker-supplied
+        prefix — otherwise the client could rotate the spoofed prefix
+        on every request to dodge the per-IP cap.
+        """
+        app.state.rate_limiter = _RateLimiter(limit_per_min=1)
+        app.state.trusted_proxies = {"127.0.0.1", "10.0.0.250"}
+        try:
+            # First request: attacker prepends "1.1.1.1", real client
+            # is "10.0.0.7" appended by the trusted proxy, which then
+            # also appends its own "10.0.0.250" hop.
+            r1 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "1.1.1.1, 10.0.0.7, 10.0.0.250"},
+            )
+            assert r1.status_code == 202
+            # Same real client; attacker rotates the spoof to "2.2.2.2".
+            # If the walk were left-to-right, this would land in a fresh
+            # bucket and pass; with RTL discarding trusted hops, it
+            # MUST collapse onto the same "10.0.0.7" bucket and 429.
+            r2 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "2.2.2.2, 10.0.0.7, 10.0.0.250"},
+            )
+            assert r2.status_code == 429
+            # And rotating to a third spoof must keep failing.
+            r3 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "3.3.3.3, 10.0.0.7, 10.0.0.250"},
+            )
+            assert r3.status_code == 429
+        finally:
+            app.state.trusted_proxies = set()
+
     async def test_rate_limit_ignores_xff_when_proxy_not_trusted(
         self, open_client: AsyncClient
     ) -> None:

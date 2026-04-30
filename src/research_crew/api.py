@@ -652,15 +652,29 @@ def _client_ip(request: Request) -> str:
     peer = request.client.host if request.client is not None and request.client.host else None
     trusted = getattr(request.app.state, "trusted_proxies", None) or set()
     if peer is not None and peer in trusted:
-        # Walk the XFF chain from left to right and take the first IP
-        # that is *not* itself a trusted proxy — that's the originating
-        # client. RFC 7239 `Forwarded: for=...` is the modern alias;
-        # XFF is the de-facto standard most LBs emit.
+        # Walk the XFF chain from RIGHT to LEFT. Proxies append the
+        # peer they observed to the END of the header, so the
+        # rightmost hop is the most recent — and therefore the most
+        # trusted — address. We discard trusted-proxy hops as we walk
+        # leftward and take the first untrusted hop adjacent to the
+        # trusted chain as the real client. A left-to-right walk would
+        # let a raw client prepend spoofed entries (the request arrives
+        # already containing ``X-Forwarded-For: 1.2.3.4``; the proxy
+        # appends its own observation) and the leftmost-first reader
+        # would happily accept the attacker's value, defeating the
+        # per-IP rate limit. RFC 7239 `Forwarded: for=...` is the
+        # modern alias; XFF is the de-facto standard most LBs emit.
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            for raw in forwarded.split(","):
+            for raw in reversed(forwarded.split(",")):
                 candidate = _canonical_ip(raw)
-                if candidate is None or candidate in trusted:
+                if candidate is None:
+                    # Garbage hop — keep walking so a single malformed
+                    # entry doesn't make us fall through to ``peer``
+                    # (which would wrongly bucket every client behind
+                    # the trusted proxy together).
+                    continue
+                if candidate in trusted:
                     continue
                 return candidate
     if peer:

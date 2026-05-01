@@ -132,16 +132,21 @@ class TestShadowOnTerminalWriteFailure:
         self, shadow_client: tuple[AsyncClient, _SelectiveFailStore]
     ) -> None:
         """Force the bg task to take the except branch by breaking the
-        workflow's `append_step` mid-flight, then break `put_run` so the
+        post-workflow `get_run` lookup, then break `put_run` so the
         recovery write also fails. The shadow must hold a FAILED record.
+
+        Note: store-side `append_step` outages are now swallowed by the
+        workflow runner (see FIX 1), so this test drives the failure
+        through a path that still escapes `_execute_run`'s try block.
         """
         client, store = shadow_client
         # First put_run (initial RUNNING blob) succeeds; later puts fail.
         store.fail_put_run_after_calls = 1
-        # Workflow's first per-step record write blows up with a store
-        # outage, so `engine.run_parallel` raises and `_execute_run`'s
-        # except branch is what eventually writes the terminal state.
-        store.fail_append_step = True
+        # The post-fan-out `get_run` (used to fetch the existing record
+        # before the terminal write) raises -> bg task except branch -> it
+        # synthesises a FAILED RunStatus, which then also can't be
+        # written, and lands in the shadow.
+        store.fail_get_run = True
 
         resp = await client.post("/research", json={"question": "what is python"})
         run_id: str = resp.json()["run_id"]

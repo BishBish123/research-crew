@@ -78,7 +78,18 @@ class WorkflowEngine:
             self._key_locks.pop(dedup_key, None)
 
     async def run_one(self, agent: Agent, question: str) -> AgentResult:
-        """Execute one agent with the durability semantics above."""
+        """Execute one agent with the durability semantics above.
+
+        Store-side hiccups (`cache_get`, `record_step`, `cache_put`) are
+        intentionally swallowed here. The audit log and idempotency cache
+        are observability/optimisation, not correctness — losing a step
+        row or a cache write must never abort agent work that already
+        succeeded. Only three classes of failure terminate `run_one`:
+
+        1. The agent itself raised (handled by retry budget).
+        2. The retry budget was exhausted on the agent.
+        3. The per-step timeout fired.
+        """
         dedup_key = self._dedup_key(agent, question)
         log = _log.bind(run_id=self.run_id, agent=agent.name.value, dedup_key=dedup_key)
         # Capture the wall-clock start once. Each StepRecord we write is
@@ -91,20 +102,21 @@ class WorkflowEngine:
         async with lock:
             # The `finally` guarantees the registry entry is dropped on
             # every exit path — success, exhausted retries, *and* an
-            # exception bubbling out of cache_get / record_step / cache_put
-            # / agent.search. Without this, a store outage leaks one lock
-            # entry per failed call and the registry grows without bound.
+            # exception bubbling out of agent.search. Store-side failures
+            # are caught inline (see `_safe_*` helpers) so they never
+            # leak; this `try/finally` exists purely for the cleanup side.
             try:
-                if self.cache_get is not None:
-                    cached = await self.cache_get(dedup_key)
-                    if cached is not None:
-                        log.info("workflow.cache_hit")
-                        # Surface the cache-hit so the caller can distinguish.
-                        return cached.model_copy(update={"status": StepStatus.CACHED})
+                cached = await self._safe_cache_get(dedup_key, log)
+                if cached is not None:
+                    log.info("workflow.cache_hit")
+                    # Surface the cache-hit so the caller can distinguish.
+                    return cached.model_copy(update={"status": StepStatus.CACHED})
 
                 last_error: str | None = None
                 for attempt in range(1, self.config.max_attempts + 1):
-                    await self._record(agent, attempt, StepStatus.RUNNING, started_at=started_at)
+                    await self._safe_record(
+                        agent, attempt, StepStatus.RUNNING, started_at=started_at, log=log
+                    )
                     t0 = time.perf_counter()
                     try:
                         result = await asyncio.wait_for(
@@ -114,24 +126,26 @@ class WorkflowEngine:
                         err = AgentTimeoutError(agent.name.value, self.config.per_step_timeout_s)
                         last_error = str(err)
                         log.warning("workflow.timeout", attempt=attempt, timeout_s=err.timeout_s)
-                        await self._record(
+                        await self._safe_record(
                             agent,
                             attempt,
                             StepStatus.FAILED,
                             error=last_error,
                             started_at=started_at,
+                            log=log,
                         )
                     except asyncio.CancelledError:
                         # Cooperative cancellation: record the failure, then let the
                         # cancellation propagate so the surrounding task tree unwinds.
                         last_error = "cancelled"
                         log.warning("workflow.cancelled", attempt=attempt)
-                        await self._record(
+                        await self._safe_record(
                             agent,
                             attempt,
                             StepStatus.FAILED,
                             error=last_error,
                             started_at=started_at,
+                            log=log,
                         )
                         raise
                     except Exception as exc:  # agents are user code; wrap in AgentExecutionError
@@ -143,12 +157,13 @@ class WorkflowEngine:
                             exc_type=type(exc).__name__,
                             error=str(exc),
                         )
-                        await self._record(
+                        await self._safe_record(
                             agent,
                             attempt,
                             StepStatus.FAILED,
                             error=last_error,
                             started_at=started_at,
+                            log=log,
                         )
                         # Suppress chaining so loggers don't double-report; semantic
                         # info is preserved in `AgentExecutionError.original`.
@@ -159,23 +174,27 @@ class WorkflowEngine:
                             final = result.model_copy(
                                 update={"attempts": attempt, "elapsed_ms": elapsed}
                             )
-                            await self._record(
-                                agent, attempt, StepStatus.SUCCEEDED, started_at=started_at
+                            await self._safe_record(
+                                agent,
+                                attempt,
+                                StepStatus.SUCCEEDED,
+                                started_at=started_at,
+                                log=log,
                             )
                             log.info("workflow.success", attempt=attempt, elapsed_ms=elapsed)
-                            if self.cache_put is not None:
-                                await self.cache_put(dedup_key, final)
+                            await self._safe_cache_put(dedup_key, final, log)
                             return final
                         last_error = result.error or "agent reported FAILED"
                         log.warning(
                             "workflow.agent_returned_failed", attempt=attempt, error=last_error
                         )
-                        await self._record(
+                        await self._safe_record(
                             agent,
                             attempt,
                             StepStatus.FAILED,
                             error=last_error,
                             started_at=started_at,
+                            log=log,
                         )
                     await self._sleep_backoff(attempt)
 
@@ -232,6 +251,75 @@ class WorkflowEngine:
                 error=error,
             )
         )
+
+    async def _safe_cache_get(
+        self, dedup_key: str, log: structlog.stdlib.BoundLogger
+    ) -> AgentResult | None:
+        """`cache_get` with store-failure suppressed.
+
+        On any exception we log `workflow.cache_unavailable_skipping` and
+        return ``None`` — i.e. behave exactly like a cache miss. The
+        agent will then run from scratch, which is correct: a cache
+        outage must never propagate as a run failure.
+        """
+        if self.cache_get is None:
+            return None
+        try:
+            return await self.cache_get(dedup_key)
+        except Exception as exc:
+            log.warning(
+                "workflow.cache_unavailable_skipping",
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return None
+
+    async def _safe_cache_put(
+        self, dedup_key: str, result: AgentResult, log: structlog.stdlib.BoundLogger
+    ) -> None:
+        """`cache_put` with store-failure suppressed.
+
+        The agent already succeeded by the time this runs — losing the
+        cache entry only costs us a re-run on the next identical request,
+        not the result we already have. Log and return.
+        """
+        if self.cache_put is None:
+            return
+        try:
+            await self.cache_put(dedup_key, result)
+        except Exception as exc:
+            log.warning(
+                "workflow.cache_put_failed_succeeding_anyway",
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+    async def _safe_record(
+        self,
+        agent: Agent,
+        attempt: int,
+        status: StepStatus,
+        *,
+        started_at: datetime,
+        error: str | None = None,
+        log: structlog.stdlib.BoundLogger,
+    ) -> None:
+        """`_record` with store-failure suppressed.
+
+        Step rows are an audit log, not the source of truth for run
+        outcome. A dropped row is a known-loss observability event, not
+        a reason to abort an otherwise successful agent run.
+        """
+        try:
+            await self._record(agent, attempt, status, error=error, started_at=started_at)
+        except Exception as exc:
+            log.warning(
+                "workflow.step_record_lost",
+                attempt=attempt,
+                step_status=status.value,
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
 
     async def _sleep_backoff(self, attempt: int) -> None:
         if attempt >= self.config.max_attempts:

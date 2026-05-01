@@ -200,9 +200,9 @@ class TestNoCacheStillRuns:
 
 class TestKeyRegistryCleanup:
     async def test_cache_put_failure_releases_lock_entry(self) -> None:
-        """If `cache_put` raises mid-flight, the per-key lock registry must
-        not retain the entry. Otherwise a flaky store leaks one lock per
-        failed call and `_key_locks` grows unbounded.
+        """`cache_put` failures are now swallowed (see FIX 1), but the
+        per-key lock registry must still drop the entry on the success
+        exit path. Otherwise long-running engines leak entries.
         """
         store = InMemoryRunStore()
 
@@ -226,16 +226,21 @@ class TestKeyRegistryCleanup:
         )
         agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
 
-        with pytest.raises(RuntimeError, match="redis ate it"):
-            await engine.run_one(agent, "q")
+        # cache_put errors are observability-only; the agent succeeded.
+        result = await engine.run_one(agent, "q")
+        assert result.status is StepStatus.SUCCEEDED
 
-        # Registry must be empty: the failed key cannot remain pinned.
+        # Registry must be empty: the key cannot remain pinned even
+        # when cache_put silently failed.
         assert engine._key_locks == {}, (
-            f"expected empty lock registry after failure, got {engine._key_locks}"
+            f"expected empty lock registry after run, got {engine._key_locks}"
         )
 
     async def test_cache_get_failure_releases_lock_entry(self) -> None:
-        """Same property when the failure is during `cache_get`."""
+        """Same property when the failure is during `cache_get`. The
+        engine treats the error as a cache miss and the agent runs;
+        the lock registry must still be empty on exit.
+        """
         store = InMemoryRunStore()
 
         async def boom_get(_: str) -> AgentResult | None:
@@ -250,10 +255,82 @@ class TestKeyRegistryCleanup:
         )
         agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
 
-        with pytest.raises(RuntimeError, match="get exploded"):
-            await engine.run_one(agent, "q")
+        result = await engine.run_one(agent, "q")
+        assert result.status is StepStatus.SUCCEEDED
 
         assert engine._key_locks == {}
+
+
+class TestStoreFailureDoesNotAbortRun:
+    """Store-side hiccups (cache_get / append_step / cache_put) must not
+    abort agent work that already succeeded — they are observability /
+    optimisation, not correctness. See FIX 1 in the workflow runner.
+    """
+
+    async def test_cache_get_failure_treated_as_miss(self) -> None:
+        store = InMemoryRunStore()
+
+        async def boom_get(_: str) -> AgentResult | None:
+            raise RuntimeError("redis get down")
+
+        engine = WorkflowEngine(
+            run_id="run-edge",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=store.append_step,
+            cache_get=boom_get,
+            cache_put=store.cache_put,
+        )
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
+
+        result = await engine.run_one(agent, "q")
+
+        assert result.status is StepStatus.SUCCEEDED, (
+            "cache_get errors must be treated as a miss, not propagated as run failure"
+        )
+
+    async def test_step_record_failure_does_not_abort(self) -> None:
+        store = InMemoryRunStore()
+
+        async def boom_record(_step: object) -> None:
+            raise RuntimeError("redis rpush down")
+
+        engine = WorkflowEngine(
+            run_id="run-edge",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=boom_record,
+            cache_get=store.cache_get,
+            cache_put=store.cache_put,
+        )
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
+
+        result = await engine.run_one(agent, "q")
+
+        assert result.status is StepStatus.SUCCEEDED, (
+            "append_step errors must not abort the surrounding run; the audit "
+            "log is observability, not correctness"
+        )
+
+    async def test_cache_put_failure_returns_result(self) -> None:
+        store = InMemoryRunStore()
+
+        async def boom_put(_key: str, _result: AgentResult) -> None:
+            raise RuntimeError("redis set down")
+
+        engine = WorkflowEngine(
+            run_id="run-edge",
+            config=WorkflowConfig(max_attempts=1, base_backoff_s=0.0),
+            record_step=store.append_step,
+            cache_get=store.cache_get,
+            cache_put=boom_put,
+        )
+        agent = MockAgent(name=AgentName.WEB_SEARCH, latency_ms=0)
+
+        result = await engine.run_one(agent, "q")
+
+        # The agent already returned SUCCEEDED; losing the cache write
+        # means we'll re-run on the next identical request, not that the
+        # run itself failed.
+        assert result.status is StepStatus.SUCCEEDED
 
 
 class TestStepRecordTimings:

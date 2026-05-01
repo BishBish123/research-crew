@@ -157,7 +157,27 @@ The all-failed case is still reported successfully (HTTP 200 +
 `state: succeeded` is the wrong answer here): `state` flips to
 `failed` only when *every* agent ultimately failed.
 
-## 10. Future work
+## 10. Auth + rate limiting
+
+The service is intentionally simple here:
+
+* `RESEARCH_API_TOKEN` env var, when set, gates `/research` and
+  `/runs/{id}` behind a `Authorization: Bearer …` header. `/health`
+  stays unauthenticated so external probes don't need provisioning.
+* When the token is unset the lifespan logs a loud
+  `api.auth_disabled` warning — that's the dev path, and the warning
+  is the contract that says "don't ship this to prod".
+* `RESEARCH_RATE_LIMIT_PER_MIN` (default 10) is a per-client-IP token
+  bucket on POST `/research`. The window is 60 seconds and overflow
+  returns `429` with a `Retry-After` header. The limiter is
+  in-process; multi-instance deployments need a Redis-backed limiter
+  before the per-IP cap is shared across the fleet.
+
+These live in `api.py` next to the lifespan rather than as a separate
+middleware so the test fixtures can poke `app.state.api_token` /
+`app.state.rate_limiter` directly without touching imports.
+
+## 11. Future work
 
 * **Real search adapters** — `httpx` calls behind the existing `Agent`
   protocol; the workflow layer needs no changes.

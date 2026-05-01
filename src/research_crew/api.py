@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 
@@ -38,6 +39,73 @@ _log = structlog.get_logger(__name__)
 # orders of magnitude more than a typical degraded-mode window. Operators
 # can override via the RESEARCH_SHADOW_MAX env var.
 _DEFAULT_SHADOW_MAX = 10_000
+
+# Default per-IP rate-limit budget for POST /research. The cost of a
+# research run is asymmetric (one HTTP call → 5 fan-out agents + Redis
+# writes), so a conservative default protects the upstream search APIs
+# from a single misbehaving client. Operators can override via
+# RESEARCH_RATE_LIMIT_PER_MIN.
+_DEFAULT_RATE_LIMIT_PER_MIN = 10
+_RATE_LIMIT_WINDOW_S = 60.0
+
+
+class _RateLimiter:
+    """Per-IP sliding-window counter for POST /research.
+
+    The window is a `deque` of timestamps newer than `now - 60s`. When
+    the window already holds `limit` entries, the next request is
+    rejected with a Retry-After hint computed from the oldest pending
+    timestamp.
+
+    Concurrency note: all reads/writes happen on the FastAPI event loop,
+    so dict/deque mutations are not interleaved at the bytecode level.
+    No explicit lock is needed.
+    """
+
+    def __init__(self, limit_per_min: int, window_s: float = _RATE_LIMIT_WINDOW_S) -> None:
+        if limit_per_min <= 0:
+            raise ValueError("limit_per_min must be positive")
+        self._limit = limit_per_min
+        self._window = window_s
+        self._buckets: dict[str, deque[float]] = {}
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def check(self, ip: str, *, now: float | None = None) -> tuple[bool, float]:
+        """Record a request for `ip`. Returns ``(allowed, retry_after_s)``.
+
+        On allow, ``retry_after_s`` is 0. On reject, it's the number of
+        seconds the caller would need to wait before the oldest in-window
+        timestamp ages out.
+        """
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - self._window
+        bucket = self._buckets.get(ip)
+        if bucket is None:
+            bucket = deque()
+            self._buckets[ip] = bucket
+        # Drop expired entries off the front before counting.
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= self._limit:
+            retry_after = max(0.0, bucket[0] + self._window - ts)
+            return False, retry_after
+        bucket.append(ts)
+        return True, 0.0
+
+    def reset(self) -> None:
+        """Test-only hook: drop all buckets."""
+        self._buckets.clear()
+
+
+# Header name carrying the bearer token. We deliberately don't use
+# FastAPI's `HTTPBearer` security scheme — the OpenAPI noise it adds
+# isn't worth it for a single-token deployment, and Bearer is the
+# de-facto convention so a plain `Authorization` header check is fine.
+_AUTH_HEADER = "Authorization"
+_BEARER_PREFIX = "Bearer "
 
 
 class _TerminalShadow:
@@ -121,6 +189,23 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
         app_.state.terminal_shadow = _TerminalShadow(
             max_size=int(os.environ.get("RESEARCH_SHADOW_MAX", _DEFAULT_SHADOW_MAX))
         )
+    # Auth token — when unset, run open and log a loud DEV-ONLY warning
+    # so operators don't ship to prod accidentally.
+    token = os.environ.get("RESEARCH_API_TOKEN")
+    if not token:
+        _log.warning(
+            "api.auth_disabled",
+            message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
+        )
+    app_.state.api_token = token or None
+    # Rate limiter is always wired up; if RESEARCH_RATE_LIMIT_PER_MIN
+    # is unset we use the conservative default. Recreate per lifespan
+    # so `make api && CTRL+C && make api` doesn't carry counters across
+    # the (logical) restart.
+    rate_per_min = int(
+        os.environ.get("RESEARCH_RATE_LIMIT_PER_MIN", _DEFAULT_RATE_LIMIT_PER_MIN)
+    )
+    app_.state.rate_limiter = _RateLimiter(limit_per_min=rate_per_min)
     try:
         yield
     finally:
@@ -137,6 +222,60 @@ async def _store_unavailable_handler(request: Request, exc: StoreUnavailableErro
     """Map any leaked StoreUnavailableError to a typed 503."""
     _log.warning("api.store_unavailable", path=request.url.path, error=str(exc))
     return JSONResponse(status_code=503, content={"detail": f"run store unavailable: {exc}"})
+
+
+def _require_auth(request: Request, authorization: str | None) -> None:
+    """Enforce bearer-token auth on the protected routes.
+
+    No-ops when ``app.state.api_token`` is unset (the dev path) — the
+    lifespan logs a loud warning in that case so unauthenticated mode
+    is loud, not silent.
+    """
+    expected: str | None = getattr(request.app.state, "api_token", None)
+    if not expected:
+        return
+    if authorization is None or not authorization.startswith(_BEARER_PREFIX):
+        raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
+    presented = authorization[len(_BEARER_PREFIX):].strip()
+    if presented != expected:
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for the rate-limit key.
+
+    The ASGI transport used in tests doesn't always populate
+    ``request.client``; fall back to a sentinel so the test path still
+    exercises the limiter (one bucket for everyone) rather than
+    short-circuiting on ``None``.
+    """
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _enforce_rate_limit(request: Request) -> None:
+    limiter: _RateLimiter | None = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        return
+    ip = _client_ip(request)
+    allowed, retry_after = limiter.check(ip)
+    if not allowed:
+        # Round up to a whole second so the Retry-After header is a
+        # well-formed integer (the RFC permits a delta-seconds *or* an
+        # HTTP-date, integer is the easier contract for clients).
+        retry_secs = max(1, int(retry_after) + 1)
+        _log.warning(
+            "api.rate_limited",
+            ip=ip,
+            limit_per_min=limiter.limit,
+            retry_after_s=retry_secs,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded: {limiter.limit} requests/min",
+            headers={"Retry-After": str(retry_secs)},
+        )
 
 
 @app.get("/health")
@@ -164,6 +303,8 @@ async def submit_research(
     payload: ResearchRequest, background: BackgroundTasks, request: Request
 ) -> dict[str, str]:
     """Enqueue a research run. Returns immediately with the run_id."""
+    _require_auth(request, request.headers.get(_AUTH_HEADER))
+    _enforce_rate_limit(request)
     run_id = uuid.uuid4().hex
     store = _store(request)
     run = RunStatus(run_id=run_id, question=payload.question, state=StepStatus.RUNNING)
@@ -192,6 +333,7 @@ def _terminal_shadow(request: Request) -> _TerminalShadow:
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> RunStatus:
+    _require_auth(request, request.headers.get(_AUTH_HEADER))
     """Return the latest known state for `run_id`.
 
     Lookup precedence (the shadow exists for the bg-task store-outage path

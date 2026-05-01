@@ -98,6 +98,30 @@ curl http://localhost:8000/runs/<run_id>
 | `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
 
+### Auth + rate limiting
+
+`/research` and `/runs/{id}` are gated behind a bearer token when
+`RESEARCH_API_TOKEN` is set; `/health` stays open so a load balancer can
+probe without a credential.
+
+```bash
+export RESEARCH_API_TOKEN=$(openssl rand -hex 32)
+make api &
+curl -H "Authorization: Bearer $RESEARCH_API_TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"question":"how does Inngest handle step retries"}' \
+     http://localhost:8000/research
+```
+
+If `RESEARCH_API_TOKEN` is unset the service runs unauthenticated and
+the lifespan logs a loud `api.auth_disabled` warning — that's the dev
+path; in production the operator MUST set the env var.
+
+POST `/research` is additionally rate-limited per client IP (token
+bucket, 60s window). Default `10 req/min/IP`; override via
+`RESEARCH_RATE_LIMIT_PER_MIN`. Exhausted callers get `429 Too Many
+Requests` plus a `Retry-After` header in seconds.
+
 ## Load test (Locust)
 
 `load/locustfile.py` posts a question, polls the run-status endpoint, and exercises `/health` for noise. The agent layer is mocked deterministically so the load test isolates the *workflow plumbing* — what you'd run before signing up for paid search APIs to find out whether the orchestration scales.

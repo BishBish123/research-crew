@@ -426,12 +426,21 @@ async def _execute_run(
     written to the in-process `shadow` cache so `GET /runs/{id}` can
     still report a terminal state — the next-best thing to a durable
     write.
+
+    On every terminal write we also emit `api.run_completed` with the
+    end-to-end latency, agent counts, and terminal state so operators
+    have a single log line to grep for run-level SLO tracking.
     """
+    run_started_at = time.monotonic()
+    succeeded_agents = 0
+    failed_agents = 0
+    agent_count = 0
     try:
         agents = default_agents()
         if payload.agents:
             wanted = set(payload.agents)
             agents = [a for a in agents if a.name in wanted]
+        agent_count = len(agents)
         engine = WorkflowEngine(
             run_id=run_id,
             record_step=store.append_step,
@@ -439,11 +448,22 @@ async def _execute_run(
             cache_put=store.cache_put,
         )
         results = await engine.run_parallel(agents, payload.question)
+        succeeded_agents = sum(1 for r in results if r.status is not StepStatus.FAILED)
+        failed_agents = sum(1 for r in results if r.status is StepStatus.FAILED)
         report: ResearchReport = await StitchSynthesizer().synthesize(
             run_id, payload.question, results
         )
         finished = await store.get_run(run_id)
         if finished is None:
+            _emit_run_completed(
+                run_id=run_id,
+                run_started_at=run_started_at,
+                terminal_state=StepStatus.FAILED,
+                agent_count=agent_count,
+                succeeded_agents=succeeded_agents,
+                failed_agents=failed_agents,
+                note="run_record_missing_at_finalization",
+            )
             return
         finished.state = (
             StepStatus.FAILED
@@ -452,7 +472,16 @@ async def _execute_run(
         )
         finished.finished_at = datetime.now(UTC)
         finished.report = report
+        finished.total_latency_ms = (time.monotonic() - run_started_at) * 1000.0
         await _persist_terminal(store, shadow, finished, agent_label="workflow_done")
+        _emit_run_completed(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            terminal_state=finished.state,
+            agent_count=agent_count,
+            succeeded_agents=succeeded_agents,
+            failed_agents=failed_agents,
+        )
     except Exception as exc:
         _log.error(
             "api.background_run_failed",
@@ -485,7 +514,46 @@ async def _execute_run(
         )
         failed.state = StepStatus.FAILED
         failed.finished_at = datetime.now(UTC)
+        failed.total_latency_ms = (time.monotonic() - run_started_at) * 1000.0
         await _persist_terminal(store, shadow, failed, agent_label="workflow_failed")
+        _emit_run_completed(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            terminal_state=StepStatus.FAILED,
+            agent_count=agent_count,
+            succeeded_agents=succeeded_agents,
+            failed_agents=max(failed_agents, agent_count - succeeded_agents),
+            note="exception_path",
+        )
+
+
+def _emit_run_completed(
+    *,
+    run_id: str,
+    run_started_at: float,
+    terminal_state: StepStatus,
+    agent_count: int,
+    succeeded_agents: int,
+    failed_agents: int,
+    note: str | None = None,
+) -> None:
+    """Single source of truth for the `api.run_completed` event.
+
+    Centralised so the happy path, the missing-record edge, and the
+    exception path all emit the same fields with the same names — a
+    single grep covers run-level SLO observability.
+    """
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "total_latency_ms": (time.monotonic() - run_started_at) * 1000.0,
+        "agent_count": agent_count,
+        "succeeded_agents": succeeded_agents,
+        "failed_agents": failed_agents,
+        "terminal_state": terminal_state.value,
+    }
+    if note:
+        payload["note"] = note
+    _log.info("api.run_completed", **payload)
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,25 @@ class TestResearchEndpoint:
         assert "scholar" in agents_seen
         assert "wikipedia" in agents_seen
 
+    async def test_terminal_run_reports_total_latency(self, client: AsyncClient) -> None:
+        """`total_latency_ms` is None until the bg task writes the
+        terminal state, then a positive monotonic-clock measurement.
+        """
+        resp = await client.post("/research", json={"question": "what is python"})
+        run_id = resp.json()["run_id"]
+
+        body: dict[str, object] = {}
+        for _ in range(20):
+            r = await client.get(f"/runs/{run_id}")
+            body = r.json()
+            if body.get("state") in ("succeeded", "failed"):
+                break
+            await asyncio.sleep(0.1)
+        assert body["state"] == "succeeded"
+        latency = body.get("total_latency_ms")
+        assert isinstance(latency, (int, float))
+        assert latency > 0.0
+
     async def test_get_unknown_run_404s(self, client: AsyncClient) -> None:
         resp = await client.get("/runs/does-not-exist")
         assert resp.status_code == 404

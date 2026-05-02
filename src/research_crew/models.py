@@ -168,3 +168,8 @@ class RunStatus(BaseModel):
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
     report: ResearchReport | None = None
+    # End-to-end wall-clock latency in milliseconds, populated only when
+    # the run reaches a terminal state. Captured by the bg task using a
+    # monotonic clock around the workflow + synthesis phase, so it's
+    # robust against wall-clock skew between submit and finish.
+    total_latency_ms: float | None = None

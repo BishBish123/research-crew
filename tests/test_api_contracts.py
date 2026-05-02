@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from research_crew.api import app
 from research_crew.errors import StoreUnavailableError
-from research_crew.models import AgentResult, RunStatus, StepRecord
+from research_crew.models import AgentName, AgentResult, RunStatus, StepRecord
 from research_crew.store import RedisRunStore, RunStore
 
 
@@ -84,7 +84,32 @@ class TestHealthShape:
 
 class TestBadPayloads:
     async def test_question_too_long_422s(self, client: AsyncClient) -> None:
-        resp = await client.post("/research", json={"question": "x" * 1024})
+        # Default max is 5000; one character past it must trip 422.
+        resp = await client.post("/research", json={"question": "x" * 5001})
+        assert resp.status_code == 422
+
+    async def test_extra_field_rejected_422(self, client: AsyncClient) -> None:
+        # `extra="forbid"` on the model must reject unknown keys.
+        resp = await client.post(
+            "/research",
+            json={"question": "what is python", "totally_unknown_field": "boom"},
+        )
+        assert resp.status_code == 422
+
+    async def test_blank_question_rejected_422(self, client: AsyncClient) -> None:
+        resp = await client.post("/research", json={"question": "    "})
+        assert resp.status_code == 422
+
+    async def test_too_many_agents_rejected_422(self, client: AsyncClient) -> None:
+        # The cap is 20; the agent enum only has 5 valid values, but a
+        # request that *repeats* valid names well past the cap must
+        # still 422 on the length check before duplicates land in the
+        # workflow.
+        too_many = [AgentName.WEB_SEARCH.value] * 21
+        resp = await client.post(
+            "/research",
+            json={"question": "what is python", "agents": too_many},
+        )
         assert resp.status_code == 422
 
     async def test_question_missing_422s(self, client: AsyncClient) -> None:

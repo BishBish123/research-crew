@@ -67,6 +67,7 @@ class TestResearchEndpoint:
         resp = await client.get("/runs/does-not-exist")
         assert resp.status_code == 404
 
-    async def test_question_min_length_enforced(self, client: AsyncClient) -> None:
-        resp = await client.post("/research", json={"question": "x"})
+    async def test_blank_question_rejected_422(self, client: AsyncClient) -> None:
+        # Whitespace-only input strips to empty and must be rejected.
+        resp = await client.post("/research", json={"question": "   "})
         assert resp.status_code == 422

@@ -1,12 +1,12 @@
 [project]
 name = "research-crew"
 version = "0.1.0"
-description = "Distributed multi-agent research service: 5 specialist agents fan-out via a Redis-backed durable workflow with idempotent steps + retries."
+description = "Concurrent multi-agent research service: 5 specialist agents fan-out via a Redis-backed durable workflow with idempotent steps + retries."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Bishara Mekhaeil" }]
-keywords = ["agents", "redis", "distributed", "fastapi", "research", "fan-out", "durable-workflow"]
+keywords = ["agents", "redis", "concurrent", "fastapi", "research", "fan-out", "durable-workflow"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",

@@ -1,6 +1,6 @@
 # research-crew
 
-> Distributed multi-agent research service. 5 specialist agents fan out in parallel via a Redis-backed durable workflow with idempotent step semantics + bounded exponential-backoff retries; results merge through a Synthesizer into a single citation-grounded report.
+> Concurrent multi-agent research service. 5 specialist agents fan out in parallel via a Redis-backed durable workflow with idempotent step semantics + bounded exponential-backoff retries; results merge through a Synthesizer into a single citation-grounded report.
 
 [![ci](https://github.com/BishBish123/research-crew/actions/workflows/ci.yml/badge.svg)](https://github.com/BishBish123/research-crew/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
@@ -122,6 +122,29 @@ bucket, 60s window). Default `10 req/min/IP`; override via
 `RESEARCH_RATE_LIMIT_PER_MIN`. Exhausted callers get `429 Too Many
 Requests` plus a `Retry-After` header in seconds.
 
+## Single-process, horizontally-scalable design
+
+The service runs as one FastAPI process — a research call fans out
+across asyncio inside that single process, not across machines. The
+"distributed" framing was misleading and has been removed; what's
+shipped is concurrent fan-out plus a durability contract that lets
+multiple instances share work safely:
+
+* **Idempotency cache lives in Redis** (`step:{dedup_key}`), so two
+  instances behind a load balancer never double-execute the same
+  `(run_id, agent, question)` triple. The second arrival short-circuits
+  on the cache and returns the result the first one wrote.
+* **Run records, step audits, and the cache TTL** are all in shared
+  Redis, so any instance can serve `GET /runs/{id}` regardless of
+  which one accepted the original POST.
+* **No instance affinity is required** — submit on instance A,
+  poll on instance B, finish on instance C: the run is durable across
+  the fleet, not pinned to one process.
+
+Promoting this to a true distributed worker pool is a swap of
+`WorkflowEngine` for an Inngest function or a Redis Streams consumer
+group; the store contract is already shaped for it.
+
 ## Load test (Locust)
 
 `load/locustfile.py` posts a question, polls the run-status endpoint, and exercises `/health` for noise. The agent layer is mocked deterministically so the load test isolates the *workflow plumbing* — what you'd run before signing up for paid search APIs to find out whether the orchestration scales.
@@ -181,7 +204,7 @@ tests/             90+ unit tests (incl. Hypothesis property tests + store contr
 - No LLM synthesizer wired in. The trace shape is identical, so plugging one in is one new class implementing `Synthesizer`.
 - No Langfuse — but the `WorkflowEngine`'s `record_step` callback is exactly the right shape to back with a Langfuse span emitter.
 - The deduplication is by URL only; semantic dedup (embed citations, cluster by cosine) is the obvious next commit.
-- "Distributed" here means "async fan-out on one process". For real distribution swap `WorkflowEngine` for an Inngest function, or use Redis Streams consumer groups for fan-in across worker processes.
+- This is a single FastAPI process with `asyncio.gather` fan-out, not a distributed system. The "Single-process, horizontally-scalable design" section above explains the deployment story; for true distribution swap `WorkflowEngine` for an Inngest function, or use Redis Streams consumer groups for fan-in across worker processes.
 
 ## License
 

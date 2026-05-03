@@ -66,6 +66,7 @@ backend. Real numbers from your run get exported by Locust to CSV
 
 | Scenario | Symptom | Mitigation |
 | --- | --- | --- |
-| Redis dropped mid-run | 503 from `/health`, run state stuck `RUNNING` | run TTL expires the orphan in 24h |
+| Redis dropped mid-run | `/health` 503s on the ping; the bg task that already finished work writes the terminal RunStatus into the in-process terminal-state shadow, so `GET /runs/{id}` returns 200 with the terminal state instead of stalling | shadow recovery path (`api._TerminalShadow` + `_persist_terminal`); orphan run records also expire via TTL after 24h once Redis returns |
 | Agent injected `failure_rate=0.5` | extra `attempts` recorded; final state still `SUCCEEDED` for a majority | retry budget catches it (ADR-003) |
 | Repeated identical question on same run | second call returns CACHED, agent never invoked | idempotency cache (ADR-002) |
+| Redis hiccup during `cache_get` / `append_step` / `cache_put` | `workflow.cache_unavailable_skipping` / `workflow.step_record_lost` / `workflow.cache_put_failed_succeeding_anyway` log lines; the run still produces a SUCCEEDED `AgentResult` | store-side calls are observability/optimisation, not correctness — guarded helpers in `WorkflowEngine.run_one` swallow them |

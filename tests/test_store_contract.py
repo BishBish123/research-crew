@@ -165,3 +165,96 @@ class TestRedisSpecific:
             assert steps[-1].attempts == 50
         finally:
             await fake.aclose()
+
+
+class TestRedisKeyPrefix:
+    """Custom prefix must round-trip across all keyspaces and reflect
+    in the raw Redis keys that ops will see in `redis-cli KEYS`.
+    """
+
+    async def test_default_prefix_lands_under_research(self) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            store = RedisRunStore(fake)
+            await store.put_run(_run())
+            await store.append_step(
+                _step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED)
+            )
+            await store.cache_put(
+                "step:abc",
+                AgentResult(
+                    agent=AgentName.WEB_SEARCH,
+                    status=StepStatus.SUCCEEDED,
+                    summary="x",
+                ),
+            )
+            keys = sorted(await fake.keys("*"))
+            # Every key sits under the default `research:` prefix.
+            assert keys == [
+                "research:run:r-1",
+                "research:run:r-1:steps",
+                "research:step:abc",
+            ]
+        finally:
+            await fake.aclose()
+
+    async def test_custom_prefix_round_trips(self) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            store = RedisRunStore(fake, prefix="staging-eu")
+            await store.put_run(_run())
+            got = await store.get_run("r-1")
+            assert got is not None and got.run_id == "r-1"
+
+            await store.append_step(
+                _step("r-1", AgentName.WEB_SEARCH, StepStatus.SUCCEEDED)
+            )
+            steps = await store.list_steps("r-1")
+            assert len(steps) == 1
+
+            result = AgentResult(
+                agent=AgentName.WEB_SEARCH,
+                status=StepStatus.SUCCEEDED,
+                summary="cached",
+            )
+            await store.cache_put("step:dedup", result)
+            cached = await store.cache_get("step:dedup")
+            assert cached is not None and cached.summary == "cached"
+
+            keys = sorted(await fake.keys("*"))
+            assert keys == [
+                "staging-eu:run:r-1",
+                "staging-eu:run:r-1:steps",
+                "staging-eu:step:dedup",
+            ]
+        finally:
+            await fake.aclose()
+
+    async def test_prefixes_isolate_writes(self) -> None:
+        """Two stores with different prefixes on the same Redis must
+        not see each other's keys — the whole point of the knob."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            a = RedisRunStore(fake, prefix="tenant-a")
+            b = RedisRunStore(fake, prefix="tenant-b")
+            await a.put_run(_run("shared", "from a"))
+            await b.put_run(_run("shared", "from b"))
+
+            from_a = await a.get_run("shared")
+            from_b = await b.get_run("shared")
+            assert from_a is not None and from_a.question == "from a"
+            assert from_b is not None and from_b.question == "from b"
+        finally:
+            await fake.aclose()
+
+    async def test_trailing_colon_is_stripped(self) -> None:
+        """Constructor must accept a prefix with or without trailing
+        colon — keys come out the same either way."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            store = RedisRunStore(fake, prefix="env:")
+            await store.put_run(_run())
+            keys = await fake.keys("*")
+            assert keys == ["env:run:r-1"]
+        finally:
+            await fake.aclose()

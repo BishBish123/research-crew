@@ -1,10 +1,16 @@
 """Redis-backed run / step / cache store.
 
-Three keyspaces, one Redis client:
+Three keyspaces, one Redis client; every key is namespaced under a
+``prefix`` (default ``"research"``) so multiple deployments or tenants
+on the same Redis instance never collide:
 
-* `run:{run_id}`        — JSON RunStatus blob (latest snapshot)
-* `run:{run_id}:steps`  — list of JSON StepRecord pushed in order
-* `step:{dedup_key}`    — JSON AgentResult (idempotency cache, TTL 1h)
+* ``{prefix}:run:{run_id}``        — JSON RunStatus blob (latest snapshot)
+* ``{prefix}:run:{run_id}:steps``  — list of JSON StepRecord pushed in order
+* ``{prefix}:step:{dedup_key}``    — JSON AgentResult (idempotency cache, TTL 1h)
+
+The prefix is read from ``RESEARCH_REDIS_PREFIX`` at API lifespan; tests
+construct ``RedisRunStore`` with an explicit prefix to assert the raw
+keys land where expected. See ADR-001 for the full rationale.
 
 Designed to drop in next to a real Inngest deployment: the run / step
 keys mirror what a workflow engine would write, so a future commit can
@@ -26,6 +32,8 @@ from research_crew.models import (
     StepStatus,
 )
 
+DEFAULT_REDIS_PREFIX = "research"
+
 
 class RunStore(Protocol):
     async def get_run(self, run_id: str) -> RunStatus | None: ...
@@ -42,37 +50,69 @@ class RunStore(Protocol):
 
 
 class RedisRunStore:
-    """RunStore backed by `redis-py` async client."""
+    """RunStore backed by `redis-py` async client.
 
-    def __init__(self, client: aioredis.Redis, ttl_seconds: int = 3600) -> None:
+    All keys are built under ``{prefix}:`` so multiple environments
+    (dev/staging/prod) or logical tenants can share one Redis without
+    cross-talk. The prefix is intentionally a constructor param rather
+    than a global so tests can pin it without env-var manipulation.
+    """
+
+    def __init__(
+        self,
+        client: aioredis.Redis,
+        ttl_seconds: int = 3600,
+        prefix: str = DEFAULT_REDIS_PREFIX,
+    ) -> None:
         self._r = client
         self._ttl = ttl_seconds
+        # Strip a trailing colon if a caller passed one — the helpers
+        # always add a colon between the prefix and the keyspace.
+        self._prefix = prefix.rstrip(":")
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix
+
+    def _run_key(self, run_id: str) -> str:
+        return f"{self._prefix}:run:{run_id}"
+
+    def _steps_key(self, run_id: str) -> str:
+        return f"{self._prefix}:run:{run_id}:steps"
+
+    def _step_cache_key(self, dedup_key: str) -> str:
+        # The workflow engine already prepends ``step:`` to dedup_key;
+        # collapse that into the prefixed namespace so the on-disk key
+        # is `{prefix}:step:{digest}` not `{prefix}:step:step:{digest}`.
+        tail = dedup_key[len("step:"):] if dedup_key.startswith("step:") else dedup_key
+        return f"{self._prefix}:step:{tail}"
 
     async def get_run(self, run_id: str) -> RunStatus | None:
-        raw = await self._r.get(f"run:{run_id}")
+        raw = await self._r.get(self._run_key(run_id))
         if raw is None:
             return None
         return RunStatus.model_validate(json.loads(raw))
 
     async def put_run(self, run: RunStatus) -> None:
-        await self._r.set(f"run:{run.run_id}", run.model_dump_json(), ex=self._ttl * 24)
+        await self._r.set(self._run_key(run.run_id), run.model_dump_json(), ex=self._ttl * 24)
 
     async def append_step(self, step: StepRecord) -> None:
-        await self._r.rpush(f"run:{step.run_id}:steps", step.model_dump_json())  # type: ignore[misc]
-        await self._r.expire(f"run:{step.run_id}:steps", self._ttl * 24)
+        key = self._steps_key(step.run_id)
+        await self._r.rpush(key, step.model_dump_json())  # type: ignore[misc]
+        await self._r.expire(key, self._ttl * 24)
 
     async def list_steps(self, run_id: str) -> list[StepRecord]:
-        raws = await self._r.lrange(f"run:{run_id}:steps", 0, -1)  # type: ignore[misc]
+        raws = await self._r.lrange(self._steps_key(run_id), 0, -1)  # type: ignore[misc]
         return [StepRecord.model_validate(json.loads(r)) for r in raws]
 
     async def cache_get(self, dedup_key: str) -> AgentResult | None:
-        raw = await self._r.get(dedup_key)
+        raw = await self._r.get(self._step_cache_key(dedup_key))
         if raw is None:
             return None
         return AgentResult.model_validate(json.loads(raw))
 
     async def cache_put(self, dedup_key: str, result: AgentResult) -> None:
-        await self._r.set(dedup_key, result.model_dump_json(), ex=self._ttl)
+        await self._r.set(self._step_cache_key(dedup_key), result.model_dump_json(), ex=self._ttl)
 
 
 class InMemoryRunStore:

@@ -184,7 +184,13 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     if getattr(app_.state, "redis", None) is None:
         client = aioredis.from_url(_redis_url(), decode_responses=True)
         app_.state.redis = client
-        app_.state.store = RedisRunStore(client)
+        # Per-deployment key prefix lets multiple environments share
+        # one Redis without cross-talk; defaults to "research" via the
+        # store constructor.
+        prefix = os.environ.get("RESEARCH_REDIS_PREFIX", "").strip()
+        app_.state.store = (
+            RedisRunStore(client, prefix=prefix) if prefix else RedisRunStore(client)
+        )
     if getattr(app_.state, "terminal_shadow", None) is None:
         app_.state.terminal_shadow = _TerminalShadow(
             max_size=int(os.environ.get("RESEARCH_SHADOW_MAX", _DEFAULT_SHADOW_MAX))

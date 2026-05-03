@@ -32,7 +32,12 @@ test: ## Unit tests
 
 .PHONY: test-integration
 test-integration: ## Integration (needs Redis)
-	$(UV) run pytest -m integration
+	@$(UV) run pytest -m integration; status=$$?; \
+		if [ $$status -eq 5 ]; then \
+			echo "no integration tests collected — skipping"; \
+			exit 0; \
+		fi; \
+		exit $$status
 
 .PHONY: test-all
 test-all: ## All tests

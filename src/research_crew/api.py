@@ -297,16 +297,20 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     # so a log scrape still surfaces it on the dev path.
     token = os.environ.get("RESEARCH_API_TOKEN")
     if not token:
+        _auth_disabled_msg = (
+            "RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY; "
+            "set RESEARCH_API_TOKEN=<token> to enable"
+        )
         if _is_dev_mode():
             _log.info(
                 "api.auth_disabled",
-                message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
+                message=_auth_disabled_msg,
                 dev_mode=True,
             )
         else:
             _log.warning(
                 "api.auth_disabled",
-                message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
+                message=_auth_disabled_msg,
             )
     app_.state.api_token = token or None
     # Rate limiter is always wired up; if RESEARCH_RATE_LIMIT_PER_MIN
@@ -532,7 +536,18 @@ def _stale_heartbeat_seconds() -> int:
     return parsed if parsed > 0 else _DEFAULT_STALE_HEARTBEAT_S
 
 
-app = FastAPI(title="research-crew", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(
+    title="research-crew",
+    version="0.1.0",
+    summary="Concurrent multi-agent research service.",
+    description=(
+        "5 specialist agents fan out in parallel via a Redis-backed durable "
+        "workflow with idempotent step semantics + bounded exponential-backoff "
+        "retries; results merge through a Synthesizer into a single "
+        "citation-grounded report."
+    ),
+    lifespan=_lifespan,
+)
 
 
 def _build_openapi() -> dict[str, object]:
@@ -553,6 +568,8 @@ def _build_openapi() -> dict[str, object]:
     schema = get_openapi(
         title=app.title,
         version=app.version,
+        summary=app.summary,
+        description=app.description,
         routes=app.routes,
     )
     if not os.environ.get("RESEARCH_API_TOKEN"):
@@ -597,6 +614,19 @@ def _require_auth(
     if not expected:
         return
     if credentials is None or credentials.scheme.lower() != "bearer":
+        # `HTTPBearer(auto_error=False)` returns ``None`` for both a
+        # missing header and a parsable-but-wrong-scheme header
+        # (e.g. ``Basic ...``). Inspect the raw header so we can return
+        # a more specific message when the scheme is the issue. Only
+        # treat it as a wrong-scheme error when the header actually has
+        # a "<scheme> <token>" shape with a non-Bearer scheme; a header
+        # with no whitespace separator is malformed, not "wrong scheme".
+        raw_header = request.headers.get(_AUTH_HEADER, "").strip()
+        parts = raw_header.split(" ", 1) if raw_header else []
+        if len(parts) == 2 and parts[0].lower() != "bearer":
+            raise HTTPException(
+                status_code=401, detail="expected Bearer scheme in Authorization header"
+            )
         raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
     # Constant-time compare so a remote caller can't infer the token via
     # response-timing across many guesses. `compare_digest` short-circuits

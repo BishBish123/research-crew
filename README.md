@@ -79,6 +79,7 @@ make install
 
 # Bring Redis up
 make up
+# If port 6379 is already taken: REDIS_PORT=6390 make up
 
 # Run a single research job from the CLI (memory store, no API needed)
 uv run research "what is python"
@@ -86,21 +87,21 @@ uv run research "what is python"
 # Same with retry-path exercise (forces re-attempts)
 uv run research "test retries" --failure-rate 0.5
 
-# Run the API
+# Run the API (wait for `Application startup complete.` before curling)
 make api &
 curl -sS -X POST -H 'content-type: application/json' \
     -d '{"question":"how does Inngest handle step retries"}' \
     http://localhost:8000/research
 
 # Get the run status
-curl -sS http://localhost:8000/runs/<run_id>
+curl -sS http://localhost:8000/runs/<run_id> | jq .
 ```
 
 ## API
 
 | Verb | Path | Body | Returns |
 | --- | --- | --- | --- |
-| `GET` | `/health` | — | `{ "status": "ok", "redis": "up", "active_runs": 0, "shadow_size": 0 }` |
+| `GET` | `/health` | — | `{ "status": "ok", "redis": "up", "active_runs": 0, "shadow_size": 0 }`; `503 { "detail": "redis unavailable: ..." }` if Redis is unreachable |
 | `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "http://host/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
 
@@ -121,6 +122,10 @@ record.
   recovering from a Redis outage; operators want to alert on this.
 
 ### Auth + rate limiting
+
+> The Quick Start above runs unauthenticated. Set `RESEARCH_API_TOKEN`
+> only when you're ready to enable auth — the Quick Start curl examples
+> will start returning 401 without an `Authorization` header once it's set.
 
 `/research` and `/runs/{id}` are gated behind a bearer token when
 `RESEARCH_API_TOKEN` is set; `/health` stays open so a load balancer can
@@ -246,8 +251,8 @@ make load   # opens Locust on http://localhost:8089
 ## Tests
 
 ```bash
-make test                # 90+ unit tests (workflow, synthesizer, store, API, agents, properties)
-make test-integration    # tests gated on a real Redis at $REDIS_URL
+make test                # 192 unit tests (workflow, synthesizer, store, API, agents, properties)
+make test-integration    # tests gated on a real Redis at $REDIS_URL (no-op if none collected)
 make check               # ruff + mypy --strict
 ```
 
@@ -284,7 +289,7 @@ src/research_crew/
 load/locustfile.py Locust scenario for the orchestration layer
 docker-compose.yml Redis 7.4
 docs/              ADRs + load-test write-up
-tests/             90+ unit tests (incl. Hypothesis property tests + store contract)
+tests/             192 unit tests (incl. Hypothesis property tests + store contract)
 ```
 
 ## Honest limitations

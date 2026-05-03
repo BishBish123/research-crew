@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from research_crew.api import app
 from research_crew.errors import StoreUnavailableError
-from research_crew.models import AgentName, AgentResult, RunStatus, StepRecord
+from research_crew.models import AgentName, AgentResult, RunStatus, StepRecord, StepStatus
 from research_crew.store import RedisRunStore, RunStore
 
 
@@ -72,14 +72,50 @@ class _ToggleFailStore:
         await self._inner.cache_put(dedup_key, result)
 
 
+class TestHealthCounters:
+    async def test_active_runs_reflects_running_records(self, client: AsyncClient) -> None:
+        """Plant N RUNNING records and assert /health reports them."""
+        store = app.state.store
+        for i in range(3):
+            await store.put_run(
+                RunStatus(
+                    run_id=f"running-{i}",
+                    question="what is python",
+                    state=StepStatus.RUNNING,
+                )
+            )
+        # One terminal record that must NOT be counted.
+        await store.put_run(
+            RunStatus(
+                run_id="done-1",
+                question="what is python",
+                state=StepStatus.SUCCEEDED,
+            )
+        )
+        resp = await client.get("/health")
+        body = resp.json()
+        assert body["active_runs"] == 3, body
+
+    async def test_shadow_size_reports_zero_when_empty(self, client: AsyncClient) -> None:
+        if hasattr(app.state, "terminal_shadow") and hasattr(app.state.terminal_shadow, "clear"):
+            app.state.terminal_shadow.clear()
+        resp = await client.get("/health")
+        assert resp.json()["shadow_size"] == 0
+
+
 class TestHealthShape:
     async def test_health_body_matches_contract(self, client: AsyncClient) -> None:
         resp = await client.get("/health")
         body = resp.json()
         assert resp.status_code == 200
-        assert set(body.keys()) == {"status", "redis"}
+        assert set(body.keys()) == {"status", "redis", "active_runs", "shadow_size"}
         assert body["status"] == "ok"
         assert body["redis"] in {"up", "down"}
+        # active_runs is None if SCAN can't run (e.g. memory store) or
+        # an int otherwise; under fakeredis it's always an int.
+        assert body["active_runs"] is None or isinstance(body["active_runs"], int)
+        assert isinstance(body["shadow_size"], int)
+        assert body["shadow_size"] >= 0
 
 
 class TestBadPayloads:

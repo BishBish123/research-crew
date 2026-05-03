@@ -94,9 +94,19 @@ curl http://localhost:8000/runs/<run_id>
 
 | Verb | Path | Body | Returns |
 | --- | --- | --- | --- |
-| `GET` | `/health` | — | `{ "status": "ok", "redis": "up" }` |
+| `GET` | `/health` | — | `{ "status": "ok", "redis": "up", "active_runs": 0, "shadow_size": 0 }` |
 | `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
+
+`/health` includes a workload snapshot beyond the basic Redis ping:
+
+* `active_runs` — count of run records currently in the `RUNNING`
+  state. Computed via a SCAN over `{prefix}:run:*` keys; returns
+  `null` if the store isn't a `RedisRunStore` (e.g. tests using the
+  in-memory backend) or if the SCAN failed (the probe still 200s).
+* `shadow_size` — number of terminal RunStatus entries the in-process
+  shadow is currently holding. Non-zero means the bg task has been
+  recovering from a Redis outage; operators want to alert on this.
 
 ### Auth + rate limiting
 

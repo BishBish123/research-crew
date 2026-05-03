@@ -285,7 +285,20 @@ def _enforce_rate_limit(request: Request) -> None:
 
 
 @app.get("/health")
-async def health(request: Request) -> dict[str, str]:
+async def health(request: Request) -> dict[str, object]:
+    """Liveness + worker-load probe.
+
+    Adds two workload-shape fields beyond the basic Redis ping:
+
+    * ``active_runs`` — count of run records whose state is RUNNING,
+      derived via a SCAN over `{prefix}:run:*` keys (skipping the
+      `:steps` lists). Falls back to ``None`` if the count couldn't be
+      computed; the probe still returns 200 in that case so a brief
+      keyspace hiccup doesn't flap a load-balancer health check.
+    * ``shadow_size`` — number of terminal RunStatus entries currently
+      held in the in-process shadow. Non-zero means the bg task has
+      been recovering from a store outage; operators want to see this.
+    """
     redis_client = getattr(request.app.state, "redis", None)
     if redis_client is None:
         raise HTTPException(status_code=503, detail="redis client not initialised")
@@ -294,7 +307,57 @@ async def health(request: Request) -> dict[str, str]:
     except Exception as exc:  # surface any connection error as 503
         _log.warning("api.health_redis_down", error=str(exc))
         raise HTTPException(status_code=503, detail=f"redis unavailable: {exc}") from exc
-    return {"status": "ok", "redis": "up" if pong else "down"}
+
+    body: dict[str, object] = {
+        "status": "ok",
+        "redis": "up" if pong else "down",
+        "active_runs": await _count_active_runs(request),
+        "shadow_size": _shadow_size(request),
+    }
+    return body
+
+
+async def _count_active_runs(request: Request) -> int | None:
+    """Best-effort count of RUNNING runs in Redis.
+
+    Uses SCAN (not KEYS) so a large keyspace doesn't block the event
+    loop. Returns ``None`` if the store isn't a `RedisRunStore`
+    instance (e.g. tests using `InMemoryRunStore`) or if the SCAN/get
+    pipeline fails — `/health` must not 5xx because of a load-info
+    side effect.
+    """
+    store = getattr(request.app.state, "store", None)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None or not isinstance(store, RedisRunStore):
+        return None
+    pattern = f"{store.prefix}:run:*"
+    try:
+        running = 0
+        async for key in redis_client.scan_iter(match=pattern, count=200):
+            # Skip the per-run `:steps` lists so we count run records
+            # exactly once. The patterns overlap because both share the
+            # `{prefix}:run:` stem.
+            if key.endswith(":steps"):
+                continue
+            raw = await redis_client.get(key)
+            if raw is None:
+                continue
+            # Parsing every record on every probe would be wasteful; a
+            # cheap substring check on the JSON `state` field is enough
+            # for this counter — false positives would require a run
+            # whose `question` literally contains `"state":"running"`,
+            # which Pydantic would reject on submit.
+            if '"state":"running"' in raw:
+                running += 1
+        return running
+    except Exception as exc:
+        _log.warning("api.health_active_runs_scan_failed", error=str(exc))
+        return None
+
+
+def _shadow_size(request: Request) -> int:
+    shadow: _TerminalShadow | None = getattr(request.app.state, "terminal_shadow", None)
+    return 0 if shadow is None else len(shadow)
 
 
 def _store(request: Request) -> RunStore:

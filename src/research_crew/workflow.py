@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -324,4 +325,22 @@ class WorkflowEngine:
     async def _sleep_backoff(self, attempt: int) -> None:
         if attempt >= self.config.max_attempts:
             return
-        await asyncio.sleep(self.config.base_backoff_s * (2 ** (attempt - 1)))
+        await asyncio.sleep(self._backoff_delay(attempt))
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Compute the per-attempt backoff with ±25% uniform jitter.
+
+        Without jitter, every parallel `run_one` retry fires at the same
+        wall-clock instant after a failure, producing thundering-herd
+        retry storms against whatever upstream is already struggling.
+        Spreading retries across a 50%-wide window breaks that
+        synchronisation while still preserving the exponential growth
+        of the base backoff. See ADR-003.
+        """
+        base = self.config.base_backoff_s * (2 ** (attempt - 1))
+        # `random.uniform` is uniform-inclusive on both ends; that's
+        # fine — the property tests only need [0.75, 1.25] inclusive.
+        # The PRNG is non-cryptographic on purpose: this is jitter
+        # for thundering-herd avoidance, not a secret.
+        jitter = float(random.uniform(0.75, 1.25))  # noqa: S311 — jitter, not crypto
+        return float(base) * jitter

@@ -30,9 +30,17 @@ runner needs a policy that:
 ## Decision
 
 * `max_attempts = 3` (configurable via `WorkflowConfig`).
-* Sleep between attempts: `base_backoff_s * 2 ** (attempt - 1)`.
-* `base_backoff_s = 0.05` so worst-case sleep is 0.05 + 0.10 = 0.15s
-  spread across two retries.
+* Sleep between attempts: `base_backoff_s * 2 ** (attempt - 1)`,
+  multiplied by a uniform `[0.75, 1.25]` jitter factor so parallel
+  retries don't synchronise on the same wall-clock instant. With five
+  fan-out agents all hitting the same upstream during a transient
+  outage, deterministic backoff would re-fire every attempt at the
+  same second; the jitter spreads them across a 50%-wide window per
+  attempt, breaking the thundering-herd loop without changing the
+  expected latency budget.
+* `base_backoff_s = 0.05` so worst-case sleep before jitter is
+  0.05 + 0.10 = 0.15s spread across two retries; with jitter that
+  becomes [0.1125, 0.1875]s.
 * Per-step wall-clock timeout (`per_step_timeout_s`, default 30s)
   protects against an attempt that simply *hangs* without raising.
 * `asyncio.CancelledError` is recorded once and re-raised — we never

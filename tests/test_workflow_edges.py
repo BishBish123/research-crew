@@ -333,6 +333,39 @@ class TestStoreFailureDoesNotAbortRun:
         assert result.status is StepStatus.SUCCEEDED
 
 
+class TestBackoffJitter:
+    """Per ADR-003: backoff is multiplied by ±25% uniform jitter to
+    avoid thundering-herd retry storms across parallel agents."""
+
+    async def test_jitter_keeps_delay_in_25_percent_band(self) -> None:
+        engine = WorkflowEngine(
+            run_id="r",
+            config=WorkflowConfig(max_attempts=5, base_backoff_s=0.1),
+        )
+        attempt = 2
+        base = engine.config.base_backoff_s * (2 ** (attempt - 1))
+        samples = [engine._backoff_delay(attempt) for _ in range(100)]
+
+        # Every sample sits inside the documented band.
+        lo, hi = base * 0.75, base * 1.25
+        for d in samples:
+            assert lo <= d <= hi, f"delay {d} outside [{lo}, {hi}]"
+
+        # And the jitter actually varies — a degenerate constant-jitter
+        # implementation would silently fail the thundering-herd guard.
+        unique = {round(d, 6) for d in samples}
+        assert len(unique) > 1, "expected the jitter to actually vary across samples"
+
+    async def test_jitter_keeps_zero_base_at_zero(self) -> None:
+        """`base_backoff_s=0` must produce zero delay regardless of jitter."""
+        engine = WorkflowEngine(
+            run_id="r",
+            config=WorkflowConfig(max_attempts=3, base_backoff_s=0.0),
+        )
+        for attempt in range(1, 4):
+            assert engine._backoff_delay(attempt) == 0.0
+
+
 class TestStepRecordTimings:
     async def test_terminal_step_preserves_real_started_at(self) -> None:
         """Terminal records must carry the wall-clock start captured at

@@ -615,6 +615,32 @@ async def _execute_run(
             succeeded_agents=succeeded_agents,
             failed_agents=failed_agents,
         )
+    except asyncio.CancelledError:
+        # Shutdown-time cancellation must still leave a terminal record
+        # behind — otherwise a polling client sees RUNNING forever and
+        # only the next-startup orphan sweep cleans it up. Persist a
+        # FAILED RunStatus with a clear reason, then let the cancellation
+        # propagate so the surrounding task tree unwinds cleanly.
+        _log.warning("api.background_run_cancelled", run_id=run_id)
+        cancelled = RunStatus(
+            run_id=run_id,
+            question=payload.question,
+            state=StepStatus.FAILED,
+            finished_at=datetime.now(UTC),
+            total_latency_ms=(time.monotonic() - run_started_at) * 1000.0,
+            error="cancelled during shutdown",
+        )
+        await _persist_terminal(store, shadow, cancelled, agent_label="workflow_cancelled")
+        _emit_run_completed(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            terminal_state=StepStatus.FAILED,
+            agent_count=agent_count,
+            succeeded_agents=succeeded_agents,
+            failed_agents=max(failed_agents, agent_count - succeeded_agents),
+            note="cancelled_during_shutdown",
+        )
+        raise
     except Exception as exc:
         _log.error(
             "api.background_run_failed",

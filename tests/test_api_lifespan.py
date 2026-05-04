@@ -12,12 +12,14 @@ smallest defensible interim. See README "Limitations".
 
 from __future__ import annotations
 
+import asyncio
+
 import fakeredis.aioredis as fake_aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from research_crew.api import _reconcile_orphan_runs, app
-from research_crew.models import RunStatus, StepStatus
+from research_crew.api import _execute_run, _reconcile_orphan_runs, _TerminalShadow, app
+from research_crew.models import ResearchRequest, RunStatus, StepStatus
 from research_crew.store import RedisRunStore
 
 
@@ -90,6 +92,57 @@ class TestReconcileOrphanRuns:
         app.state.store = store
         # Just must not raise.
         await _reconcile_orphan_runs(app)
+        await fake.aclose()
+
+
+class TestExecuteRunCancellation:
+    """Shutdown-time cancellation of `_execute_run` must still write a
+    terminal RunStatus before the CancelledError propagates. Without
+    that, the run is stuck at RUNNING until the next-process orphan
+    sweep — observably "running forever" from the client's perspective.
+    """
+
+    async def test_cancelled_run_persists_terminal_state_then_reraises(self) -> None:
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        shadow = _TerminalShadow()
+
+        # Plant the initial RUNNING record the way POST /research would.
+        running = RunStatus(
+            run_id="cancel-me",
+            question="what is python",
+            state=StepStatus.RUNNING,
+        )
+        await store.put_run(running)
+
+        async def _go() -> None:
+            await _execute_run(
+                store, shadow, "cancel-me",
+                ResearchRequest(question="what is python"),
+            )
+
+        task = asyncio.create_task(_go())
+        # Yield once so the task starts executing the workflow body.
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Either the store has the FAILED record, or the shadow does
+        # (depending on which side of the put_run the cancel landed).
+        # Both paths must surface a terminal state with the cancellation
+        # message so a polling client sees a clear answer.
+        observed = await store.get_run("cancel-me")
+        if observed is not None and observed.state is StepStatus.FAILED:
+            assert observed.error == "cancelled during shutdown"
+        else:
+            shadow_entry = shadow.get("cancel-me")
+            assert shadow_entry is not None, (
+                "cancellation must persist via store OR shadow, not vanish"
+            )
+            assert shadow_entry.state is StepStatus.FAILED
+            assert shadow_entry.error == "cancelled during shutdown"
+
         await fake.aclose()
 
 

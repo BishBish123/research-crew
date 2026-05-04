@@ -212,12 +212,76 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
         os.environ.get("RESEARCH_RATE_LIMIT_PER_MIN", _DEFAULT_RATE_LIMIT_PER_MIN)
     )
     app_.state.rate_limiter = _RateLimiter(limit_per_min=rate_per_min)
+    # Best-effort reconciliation of any RUNNING runs left behind by a
+    # previous process. Background execution is bound to the accepting
+    # instance, so a process restart strands those runs in RUNNING with
+    # no worker — without reconciliation, callers would poll forever.
+    # A durable worker queue is the proper fix; this is the smallest
+    # defensible interim. See README "Limitations".
+    await _reconcile_orphan_runs(app_)
     try:
         yield
     finally:
         if getattr(app_.state, "redis", None) is not None:
             with contextlib.suppress(Exception):
                 await app_.state.redis.aclose()
+
+
+async def _reconcile_orphan_runs(app_: FastAPI) -> None:
+    """Mark any RUNNING run records FAILED on startup.
+
+    Background execution is in-process, so a previous process that
+    crashed or was killed mid-run leaves RUNNING records in Redis with
+    no worker behind them. Sweep the keyspace once at startup and flip
+    each one to FAILED with a clear "abandoned by previous process"
+    error so polling clients get a terminal answer instead of looping
+    forever.
+
+    This is best-effort: we swallow any scan/parse error so a transient
+    Redis hiccup at startup doesn't block the service from coming up.
+    A durable worker queue (Inngest, Temporal, Redis Streams consumer
+    group) is the right long-term fix; tracked under "Limitations" in
+    README.
+    """
+    store = getattr(app_.state, "store", None)
+    redis_client = getattr(app_.state, "redis", None)
+    if redis_client is None or not isinstance(store, RedisRunStore):
+        return
+    pattern = f"{store.prefix}:run:*"
+    reconciled = 0
+    try:
+        # SCAN to avoid blocking the loop on a large keyspace; the same
+        # shape /health uses so the cost profile is already understood.
+        async for key in redis_client.scan_iter(match=pattern, count=200):
+            if key.endswith(":steps"):
+                continue
+            try:
+                raw = await redis_client.get(key)
+            except Exception as exc:  # transient — log and skip this key
+                _log.warning("api.reconcile_get_failed", key=key, error=str(exc))
+                continue
+            if raw is None or '"state":"running"' not in raw:
+                continue
+            try:
+                run = RunStatus.model_validate_json(raw)
+            except Exception as exc:
+                _log.warning("api.reconcile_parse_failed", key=key, error=str(exc))
+                continue
+            if run.state is not StepStatus.RUNNING:
+                continue
+            run.state = StepStatus.FAILED
+            run.finished_at = datetime.now(UTC)
+            run.error = "abandoned by previous process"
+            try:
+                await store.put_run(run)
+                reconciled += 1
+            except Exception as exc:
+                _log.warning("api.reconcile_put_failed", run_id=run.run_id, error=str(exc))
+    except Exception as exc:
+        _log.warning("api.reconcile_scan_failed", error=str(exc))
+        return
+    if reconciled:
+        _log.warning("api.reconciled_orphan_runs", count=reconciled)
 
 
 app = FastAPI(title="research-crew", version="0.1.0", lifespan=_lifespan)

@@ -173,3 +173,7 @@ class RunStatus(BaseModel):
     # monotonic clock around the workflow + synthesis phase, so it's
     # robust against wall-clock skew between submit and finish.
     total_latency_ms: float | None = None
+    # Run-level error explanation for terminal-FAILED runs that don't
+    # have a `report` (e.g. orphans reconciled by a fresh process after
+    # an unclean restart of the previous one).
+    error: str | None = None

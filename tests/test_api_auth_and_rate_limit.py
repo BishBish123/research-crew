@@ -123,6 +123,31 @@ class TestAuthOpen:
         assert resp.status_code == 404
 
 
+class TestOpenApiSecurityScheme:
+    """The OpenAPI doc must advertise the bearer scheme + a 401 response
+    on the protected routes so generated clients know to send the
+    `Authorization: Bearer …` header.
+    """
+
+    async def test_openapi_advertises_bearer_scheme(self, open_client: AsyncClient) -> None:
+        r = await open_client.get("/openapi.json")
+        assert r.status_code == 200
+        spec = r.json()
+
+        # Security scheme is declared.
+        schemes = spec.get("components", {}).get("securitySchemes", {})
+        assert any(
+            s.get("type") == "http" and s.get("scheme") == "bearer"
+            for s in schemes.values()
+        ), f"expected an HTTP bearer security scheme; got {schemes}"
+
+        # 401 response is documented on /research and /runs/{run_id}.
+        post_research = spec["paths"]["/research"]["post"]
+        get_run = spec["paths"]["/runs/{run_id}"]["get"]
+        assert "401" in post_research["responses"]
+        assert "401" in get_run["responses"]
+
+
 class TestRateLimit:
     async def test_rate_limit_returns_429(self, open_client: AsyncClient) -> None:
         """The (N+1)th request inside the window returns 429 with

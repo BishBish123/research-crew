@@ -16,8 +16,9 @@ import redis.asyncio as aioredis
 import structlog
 import typer
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.exceptions import RedisError
 
 from research_crew.agents import default_agents
@@ -101,12 +102,15 @@ class _RateLimiter:
         self._buckets.clear()
 
 
-# Header name carrying the bearer token. We deliberately don't use
-# FastAPI's `HTTPBearer` security scheme — the OpenAPI noise it adds
-# isn't worth it for a single-token deployment, and Bearer is the
-# de-facto convention so a plain `Authorization` header check is fine.
+# Header name carrying the bearer token. The actual auth check is
+# manual (`_require_auth`) so we can keep the dev-mode "no token set →
+# unauthenticated" path without surfacing it as a special case in the
+# OpenAPI doc. We *also* declare the FastAPI `HTTPBearer` security
+# scheme as a dependency so /openapi.json advertises the bearer
+# requirement to clients.
 _AUTH_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
+_bearer_scheme = HTTPBearer(auto_error=False, description="Bearer token issued out-of-band.")
 
 
 class _TerminalShadow:
@@ -465,9 +469,21 @@ def _store(request: Request) -> RunStore:
     return store  # type: ignore[no-any-return]
 
 
-@app.post("/research", status_code=202)
+_AUTH_RESPONSES: dict[int | str, dict[str, object]] = {
+    401: {"description": "Missing or invalid bearer token."},
+}
+
+
+@app.post(
+    "/research",
+    status_code=202,
+    responses=_AUTH_RESPONSES,
+)
 async def submit_research(
-    payload: ResearchRequest, background: BackgroundTasks, request: Request
+    payload: ResearchRequest,
+    background: BackgroundTasks,
+    request: Request,
+    _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> dict[str, str]:
     """Enqueue a research run. Returns immediately with the run_id."""
     _require_auth(request, request.headers.get(_AUTH_HEADER))
@@ -498,8 +514,15 @@ def _terminal_shadow(request: Request) -> _TerminalShadow:
     return shadow
 
 
-@app.get("/runs/{run_id}")
-async def get_run(run_id: str, request: Request) -> RunStatus:
+@app.get(
+    "/runs/{run_id}",
+    responses=_AUTH_RESPONSES,
+)
+async def get_run(
+    run_id: str,
+    request: Request,
+    _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> RunStatus:
     _require_auth(request, request.headers.get(_AUTH_HEADER))
     """Return the latest known state for `run_id`.
 

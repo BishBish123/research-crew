@@ -128,6 +128,15 @@ class TestShadowOnTerminalWriteFailure:
         assert body["run_id"] == run_id
         # Shadow should contain exactly this run.
         assert run_id in app.state.terminal_shadow
+        # The store stayed reachable for `list_steps` (only `put_run` failed),
+        # so the shadow response must include the per-agent audit rows
+        # via FIX 5's hydrate-on-read path.
+        steps = body.get("steps", [])
+        assert isinstance(steps, list)
+        assert len(steps) > 0, (
+            "shadow response must hydrate steps from the store when reachable; "
+            f"got empty list. body={body}"
+        )
 
     async def test_bg_failed_path_records_failed_in_shadow(
         self, shadow_client: tuple[AsyncClient, _SelectiveFailStore]
@@ -188,6 +197,21 @@ class TestShadowOnTerminalWriteFailure:
             state=StepStatus.RUNNING,
         )
         await store._inner.put_run(stuck)
+        # Plant a step row into the store too — this is what the bg task
+        # would have written for the agent attempts before the store
+        # outage hit on the terminal put_run. FIX 5 says the shadow
+        # response should hydrate from the store when reachable.
+        now = datetime.now(UTC)
+        await store._inner.append_step(
+            StepRecord(
+                run_id=run_id,
+                agent=AgentName.WEB_SEARCH,
+                status=StepStatus.SUCCEEDED,
+                attempts=1,
+                started_at=now,
+                finished_at=now,
+            )
+        )
 
         # Plant a terminal record into the shadow — this is what the bg
         # task would have written via `_persist_terminal` after its store
@@ -200,6 +224,9 @@ class TestShadowOnTerminalWriteFailure:
         body = r.json()
         # Shadow wins over the stuck RUNNING blob.
         assert body["state"] == "failed"
+        # Steps are hydrated from the store on the shadow path (FIX 5).
+        agents_seen = {s["agent"] for s in body["steps"]}
+        assert agents_seen == {"web_search"}
 
     async def test_shadow_served_when_store_404s(
         self, shadow_client: tuple[AsyncClient, _SelectiveFailStore]

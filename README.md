@@ -135,25 +135,52 @@ Requests` plus a `Retry-After` header in seconds.
 ## Single-process, horizontally-scalable design
 
 The service runs as one FastAPI process — a research call fans out
-across asyncio inside that single process, not across machines. The
-"distributed" framing was misleading and has been removed; what's
+across asyncio inside that single process, not across machines. What's
 shipped is concurrent fan-out plus a durability contract that lets
-multiple instances share work safely:
+multiple instances share *state* safely, with one important caveat
+about *execution* spelled out in Limitations below.
 
 * **Idempotency cache lives in Redis** (`step:{dedup_key}`), so two
   instances behind a load balancer never double-execute the same
   `(run_id, agent, question)` triple. The second arrival short-circuits
   on the cache and returns the result the first one wrote.
-* **Run records, step audits, and the cache TTL** are all in shared
-  Redis, so any instance can serve `GET /runs/{id}` regardless of
-  which one accepted the original POST.
-* **No instance affinity is required** — submit on instance A,
-  poll on instance B, finish on instance C: the run is durable across
-  the fleet, not pinned to one process.
+* **Run records and step audits** live in shared Redis, so any
+  instance can serve `GET /runs/{id}` regardless of which instance
+  accepted the original POST. Cross-instance reads are stateless.
+* **Background execution is bound to the accepting instance.** When a
+  POST `/research` is accepted, the run is executed by an in-process
+  FastAPI BackgroundTask on that same instance. `GET /runs/{id}` is
+  cross-instance, but the worker is not.
 
-Promoting this to a true distributed worker pool is a swap of
-`WorkflowEngine` for an Inngest function or a Redis Streams consumer
-group; the store contract is already shaped for it.
+Promoting this to a true distributed worker pool is a swap of the
+in-process BackgroundTask for an Inngest function or a Redis Streams
+consumer group; the store contract is already shaped for it. See
+`ARCHITECTURE.md` § "Future work".
+
+## Limitations
+
+* **Execution is single-instance, state is multi-instance.** POST
+  `/research` and GET `/runs/{id}` are stateless across instances
+  (everything lives in Redis). The actual *workflow execution*,
+  however, runs as an in-process FastAPI BackgroundTask on the
+  instance that accepted the submit. This is documented above; the
+  implication is that a process restart mid-run strands that run with
+  no worker behind it.
+* **Best-effort orphan reconciliation on startup.** At lifespan
+  startup the API SCANs `{prefix}:run:*` and flips any RUNNING record
+  to FAILED with `error: "abandoned by previous process"` so polling
+  clients see a terminal answer instead of looping forever. This is
+  *not* a durable retry — the run isn't re-executed, it's marked
+  failed. A proper durable worker queue is on the roadmap (Inngest /
+  Redis Streams consumer group).
+* **Best-effort terminal-state shadow.** If the bg task finishes work
+  but the store rejects the terminal write (Redis outage), the
+  RunStatus is stashed in an in-process bounded shadow so a
+  subsequent GET still surfaces a terminal state. The shadow is
+  per-process and does not survive a restart.
+* **In-process rate limiter.** `RESEARCH_RATE_LIMIT_PER_MIN` is a
+  per-process counter; multi-instance deployments will see N times the
+  per-IP cap until the limiter is moved into Redis.
 
 ## Load test (Locust)
 

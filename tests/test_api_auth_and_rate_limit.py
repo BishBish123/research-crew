@@ -176,3 +176,68 @@ class TestRateLimiterUnit:
             _RateLimiter(limit_per_min=0)
         with pytest.raises(ValueError):
             _RateLimiter(limit_per_min=-1)
+
+
+class TestTrustedProxyXFF:
+    """When the immediate peer is a trusted proxy the rate limiter
+    keys on the originating client IP from `X-Forwarded-For`. When
+    it is *not* trusted, XFF is ignored — otherwise any caller could
+    spoof the header to dodge the per-IP cap.
+    """
+
+    async def test_rate_limit_uses_xff_when_proxy_trusted(
+        self, open_client: AsyncClient
+    ) -> None:
+        # A tight limiter so we can prove two distinct client IPs each
+        # get their own bucket *through* the same trusted proxy.
+        app.state.rate_limiter = _RateLimiter(limit_per_min=1)
+        # The test ASGI transport reports request.client.host as
+        # something like "127.0.0.1" — pin the peer as trusted so the
+        # XFF walk runs.
+        app.state.trusted_proxies = {"127.0.0.1"}
+        try:
+            r1 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.1"},
+            )
+            assert r1.status_code == 202
+            # Same proxy, different client IP — must get its own slot.
+            r2 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.2"},
+            )
+            assert r2.status_code == 202
+            # Same client IP again — must hit the cap.
+            r3 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.1"},
+            )
+            assert r3.status_code == 429
+        finally:
+            app.state.trusted_proxies = set()
+
+    async def test_rate_limit_ignores_xff_when_proxy_not_trusted(
+        self, open_client: AsyncClient
+    ) -> None:
+        """No trusted-proxy config -> all requests share the peer's
+        bucket regardless of XFF. A spoofer can't get a fresh slot by
+        rotating the header value.
+        """
+        app.state.rate_limiter = _RateLimiter(limit_per_min=1)
+        app.state.trusted_proxies = set()
+        r1 = await open_client.post(
+            "/research",
+            json={"question": "what is python"},
+            headers={"X-Forwarded-For": "10.0.0.1"},
+        )
+        assert r1.status_code == 202
+        # Different XFF; same peer -> still the same bucket -> 429.
+        r2 = await open_client.post(
+            "/research",
+            json={"question": "what is python"},
+            headers={"X-Forwarded-For": "10.0.0.99"},
+        )
+        assert r2.status_code == 429

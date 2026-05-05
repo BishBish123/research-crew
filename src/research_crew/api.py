@@ -213,6 +213,16 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
         os.environ.get("RESEARCH_RATE_LIMIT_PER_MIN", _DEFAULT_RATE_LIMIT_PER_MIN)
     )
     app_.state.rate_limiter = _RateLimiter(limit_per_min=rate_per_min)
+    # Trusted-proxy set for X-Forwarded-For honouring. CSV of bare IPs
+    # (CIDR is intentionally NOT supported here — keeping the surface
+    # small until there's a concrete need; an operator running on AWS
+    # ALB enumerates the front-end IPs in their config). Empty default
+    # means XFF is ignored, which is the safe behaviour for direct
+    # exposure.
+    raw_proxies = os.environ.get("RESEARCH_TRUSTED_PROXIES", "").strip()
+    app_.state.trusted_proxies = (
+        {p.strip() for p in raw_proxies.split(",") if p.strip()} if raw_proxies else set()
+    )
     # Best-effort reconciliation of any RUNNING runs left behind by a
     # previous process. Background execution is bound to the accepting
     # instance, so a process restart strands those runs in RUNNING with
@@ -318,13 +328,33 @@ def _require_auth(request: Request, authorization: str | None) -> None:
 def _client_ip(request: Request) -> str:
     """Best-effort client IP for the rate-limit key.
 
+    Honour the ``X-Forwarded-For`` header only when the immediate peer
+    (``request.client.host``) is in the operator-configured trusted-
+    proxy set (``RESEARCH_TRUSTED_PROXIES`` CSV). Without that gate a
+    raw client could spoof XFF to evade per-IP limits; with it, real
+    deployments behind ALB/nginx/Cloudflare see the originating
+    client IP.
+
     The ASGI transport used in tests doesn't always populate
     ``request.client``; fall back to a sentinel so the test path still
     exercises the limiter (one bucket for everyone) rather than
     short-circuiting on ``None``.
     """
-    if request.client is not None and request.client.host:
-        return request.client.host
+    peer = request.client.host if request.client is not None and request.client.host else None
+    trusted = getattr(request.app.state, "trusted_proxies", None) or set()
+    if peer is not None and peer in trusted:
+        # Walk the XFF chain from left to right and take the first IP
+        # that is *not* itself a trusted proxy — that's the originating
+        # client. RFC 7239 `Forwarded: for=...` is the modern alias;
+        # XFF is the de-facto standard most LBs emit.
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            for raw in forwarded.split(","):
+                candidate = raw.strip()
+                if candidate and candidate not in trusted:
+                    return candidate
+    if peer:
+        return peer
     return "unknown"
 
 

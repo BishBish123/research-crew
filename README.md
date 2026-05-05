@@ -127,10 +127,17 @@ If `RESEARCH_API_TOKEN` is unset the service runs unauthenticated and
 the lifespan logs a loud `api.auth_disabled` warning — that's the dev
 path; in production the operator MUST set the env var.
 
-POST `/research` is additionally rate-limited per client IP (token
-bucket, 60s window). Default `10 req/min/IP`; override via
-`RESEARCH_RATE_LIMIT_PER_MIN`. Exhausted callers get `429 Too Many
-Requests` plus a `Retry-After` header in seconds.
+POST `/research` is additionally rate-limited per client IP
+(sliding-window counter, 60s window). Default `10 req/min/IP`;
+override via `RESEARCH_RATE_LIMIT_PER_MIN`. Exhausted callers get
+`429 Too Many Requests` plus a `Retry-After` header in seconds.
+
+When the service runs behind a reverse proxy (ALB, nginx, Cloudflare),
+set `RESEARCH_TRUSTED_PROXIES` to a CSV of the proxy IPs. The limiter
+will then key on the first non-trusted IP from the
+`X-Forwarded-For` chain instead of the proxy's own IP. With this
+unset (the default) the header is ignored, so a direct caller cannot
+spoof XFF to get a fresh bucket.
 
 ## Single-process, horizontally-scalable design
 

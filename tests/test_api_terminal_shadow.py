@@ -10,6 +10,7 @@ memory until the store recovers.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import fakeredis.aioredis as fake_aioredis
 import pytest
@@ -17,7 +18,7 @@ from httpx import ASGITransport, AsyncClient
 
 from research_crew.api import _TerminalShadow, app
 from research_crew.errors import StoreUnavailableError
-from research_crew.models import AgentResult, RunStatus, StepRecord, StepStatus
+from research_crew.models import AgentName, AgentResult, RunStatus, StepRecord, StepStatus
 from research_crew.store import RedisRunStore, RunStore
 
 
@@ -252,6 +253,79 @@ class TestShadowOnTerminalWriteFailure:
         store.fail_get_run = True
         r = await client.get("/runs/never-heard-of-it")
         assert r.status_code == 503
+
+    async def test_shadow_response_hydrates_steps_when_store_returns(
+        self, shadow_client: tuple[AsyncClient, _SelectiveFailStore]
+    ) -> None:
+        """Shadow path returns the run, but if the store is reachable
+        for `list_steps` we should fold those rows into the response
+        rather than returning `steps=[]`.
+
+        The shadow is populated *before* per-attempt step rows land in
+        the store, so without this hydration callers see a terminal
+        state with no audit trail even when the store has the rows.
+        """
+        client, store = shadow_client
+        run_id = "hydrate-me"
+        # Plant a terminal record into the shadow only.
+        terminal = RunStatus(
+            run_id=run_id,
+            question="what is python",
+            state=StepStatus.SUCCEEDED,
+        )
+        app.state.terminal_shadow[run_id] = terminal
+        # Pre-populate steps in the store.
+        now = datetime.now(UTC)
+        await store._inner.append_step(
+            StepRecord(
+                run_id=run_id,
+                agent=AgentName.WEB_SEARCH,
+                status=StepStatus.SUCCEEDED,
+                attempts=1,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        await store._inner.append_step(
+            StepRecord(
+                run_id=run_id,
+                agent=AgentName.SCHOLAR,
+                status=StepStatus.SUCCEEDED,
+                attempts=1,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        # Force the response to come from the shadow path: store outage
+        # for the run-fetch, but list_steps still works.
+        store.fail_get_run = True
+        r = await client.get(f"/runs/{run_id}")
+        assert r.status_code == 200
+        body = r.json()
+        agents_seen = {s["agent"] for s in body["steps"]}
+        assert agents_seen == {"web_search", "scholar"}, (
+            f"shadow response must hydrate steps from the store; got {agents_seen}"
+        )
+
+    async def test_shadow_response_keeps_empty_steps_when_store_unreachable(
+        self, shadow_client: tuple[AsyncClient, _SelectiveFailStore]
+    ) -> None:
+        """If list_steps also fails, the response carries empty steps
+        rather than 503 — surfacing a terminal state with no audit is
+        strictly better than not surfacing it at all."""
+        client, store = shadow_client
+        run_id = "hydrate-fail"
+        terminal = RunStatus(
+            run_id=run_id,
+            question="what is python",
+            state=StepStatus.FAILED,
+        )
+        app.state.terminal_shadow[run_id] = terminal
+        store.fail_get_run = True
+        store.fail_list_steps = True
+        r = await client.get(f"/runs/{run_id}")
+        assert r.status_code == 200
+        assert r.json()["steps"] == []
 
 
 class TestShadowDoesNotPolluteOnSuccess:

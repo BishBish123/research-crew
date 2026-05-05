@@ -487,7 +487,7 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
         shadow_run = shadow.get(run_id)
         if shadow_run is not None:
             _log.info("api.get_run_served_from_shadow_on_outage", run_id=run_id)
-            return shadow_run
+            return await _hydrate_steps_best_effort(store, run_id, shadow_run)
         _log.warning("api.store_down_on_get", run_id=run_id, error=str(exc))
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
 
@@ -495,14 +495,14 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
         shadow_run = shadow.get(run_id)
         if shadow_run is not None:
             _log.info("api.get_run_served_from_shadow_on_404", run_id=run_id)
-            return shadow_run
+            return await _hydrate_steps_best_effort(store, run_id, shadow_run)
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
 
     if run.state not in _TERMINAL_STATES:
         shadow_run = shadow.get(run_id)
         if shadow_run is not None:
             _log.info("api.get_run_shadow_overrides_running", run_id=run_id)
-            return shadow_run
+            return await _hydrate_steps_best_effort(store, run_id, shadow_run)
 
     try:
         run.steps = await store.list_steps(run_id)
@@ -510,6 +510,34 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
         _log.warning("api.store_down_on_list_steps", run_id=run_id, error=str(exc))
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
     return run
+
+
+async def _hydrate_steps_best_effort(
+    store: RunStore, run_id: str, run: RunStatus
+) -> RunStatus:
+    """When serving from the shadow, try once to populate `steps` from
+    the store. If the store is unreachable (the same outage that drove
+    us to the shadow in the first place), log and return the shadow as
+    -is with empty steps — surfacing a terminal state with no audit is
+    strictly better than 503ing.
+
+    The shadow is constructed before the workflow appends step rows, so
+    without this hydration GET would always return `steps=[]` even when
+    the store *does* have them — see FIX 5.
+    """
+    try:
+        steps = await store.list_steps(run_id)
+    except Exception as exc:  # outage that put us on the shadow path
+        _log.warning(
+            "api.shadow_step_hydrate_failed",
+            run_id=run_id,
+            exc_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return run
+    # Mutate a copy so a future shadow read still sees the cached entry
+    # without the steps populated (cheaper than re-list on every GET).
+    return run.model_copy(update={"steps": steps})
 
 
 # ---------------------------------------------------------------------------

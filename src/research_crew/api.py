@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import secrets
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -307,7 +308,10 @@ def _require_auth(request: Request, authorization: str | None) -> None:
     if authorization is None or not authorization.startswith(_BEARER_PREFIX):
         raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
     presented = authorization[len(_BEARER_PREFIX):].strip()
-    if presented != expected:
+    # Constant-time compare so a remote caller can't infer the token via
+    # response-timing across many guesses. `compare_digest` short-circuits
+    # only on length mismatch, which is the documented limit.
+    if not secrets.compare_digest(presented, expected):
         raise HTTPException(status_code=401, detail="invalid bearer token")
 
 

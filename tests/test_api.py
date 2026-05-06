@@ -90,3 +90,27 @@ class TestResearchEndpoint:
         # Whitespace-only input strips to empty and must be rejected.
         resp = await client.post("/research", json={"question": "   "})
         assert resp.status_code == 422
+
+    async def test_422_detail_shape_pinned(self, client: AsyncClient) -> None:
+        """Pin the FastAPI 422 envelope so the OpenAPI contract is
+        protected against silent shape drift.
+
+        For a `question` whose type is wrong (int instead of str)
+        FastAPI emits a `detail[]` array with `loc`, `msg`, `type`
+        per error. Generated clients consume this shape — we want a
+        red test if it changes.
+        """
+        resp = await client.post("/research", json={"question": 42})
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body and isinstance(body["detail"], list) and body["detail"]
+        first = body["detail"][0]
+        assert isinstance(first.get("loc"), list)
+        # The leading element of `loc` is "body" for body-payload errors.
+        assert first["loc"][0] == "body"
+        # And the offending field is `question`.
+        assert "question" in first["loc"]
+        assert isinstance(first.get("msg"), str) and first["msg"]
+        # `type` is a stable Pydantic identifier (e.g. "string_type").
+        assert isinstance(first.get("type"), str) and first["type"]
+        assert "string" in first["type"]

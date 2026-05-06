@@ -167,11 +167,14 @@ The service is intentionally simple here:
 * When the token is unset the lifespan logs a loud
   `api.auth_disabled` warning — that's the dev path, and the warning
   is the contract that says "don't ship this to prod".
-* `RESEARCH_RATE_LIMIT_PER_MIN` (default 10) is a per-client-IP token
-  bucket on POST `/research`. The window is 60 seconds and overflow
-  returns `429` with a `Retry-After` header. The limiter is
-  in-process; multi-instance deployments need a Redis-backed limiter
-  before the per-IP cap is shared across the fleet.
+* `RESEARCH_RATE_LIMIT_PER_MIN` (default 10) is a per-client-IP
+  sliding-window counter on POST `/research`: the limiter holds a
+  deque of request timestamps newer than `now - 60s` and rejects when
+  the deque length already equals the cap. Overflow returns `429`
+  with a `Retry-After` header derived from the oldest in-window
+  timestamp. The limiter is in-process; multi-instance deployments
+  need a Redis-backed limiter before the per-IP cap is shared across
+  the fleet.
 
 These live in `api.py` next to the lifespan rather than as a separate
 middleware so the test fixtures can poke `app.state.api_token` /

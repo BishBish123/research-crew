@@ -7,8 +7,9 @@ The product surface is intentionally small:
   balancer can probe without provisioning a token.
 * When the token is unset, the service runs unauthenticated and the
   lifespan logs a loud warning — the dev-loop default.
-* `RESEARCH_RATE_LIMIT_PER_MIN` (default: 10) is a per-IP token bucket
-  on POST `/research`; reaching the cap returns 429 with `Retry-After`.
+* `RESEARCH_RATE_LIMIT_PER_MIN` (default: 10) is a per-IP sliding-window
+  counter on POST `/research`; reaching the cap returns 429 with
+  `Retry-After`.
 
 These tests poke `app.state.api_token` / `app.state.rate_limiter`
 directly because the ASGI transport bypasses the FastAPI lifespan;

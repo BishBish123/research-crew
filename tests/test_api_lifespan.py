@@ -13,6 +13,7 @@ smallest defensible interim. See README "Limitations".
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 
 import fakeredis.aioredis as fake_aioredis
 import pytest
@@ -147,7 +148,7 @@ class TestExecuteRunCancellation:
 
 
 @pytest.fixture(autouse=True)
-def _clear_state() -> None:
+def _clear_state() -> Iterator[None]:
     """Reset `app.state.redis`/`app.state.store` after each test so a
     leaked closed client doesn't poison later fixtures."""
     yield

@@ -366,6 +366,39 @@ class TestBackoffJitter:
             assert engine._backoff_delay(attempt) == 0.0
 
 
+class TestAgentExecutionErrorPropagates:
+    """The workflow runner wraps a raised agent exception in
+    `AgentExecutionError`. The wrapper's typed handle should survive
+    long enough for callers (logs, future Inngest mapper) to match on
+    it — concretely, the StepRecord's `error` string and the
+    `workflow.agent_error` log line both name the wrapper, not the
+    inner exception.
+    """
+
+    async def test_agent_execution_error_propagates_typed(self) -> None:
+        store = InMemoryRunStore()
+        engine = _engine(store, max_attempts=1)
+
+        class Boom:
+            name = AgentName.SCHOLAR
+
+            async def search(self, q: str) -> AgentResult:
+                raise ValueError("nope")
+
+        result = await engine.run_one(Boom(), "q")
+        assert result.status is StepStatus.FAILED
+        # The terminal AgentResult.error carries the typed wrapper name.
+        assert result.error is not None
+        assert "AgentExecutionError" in result.error
+        # The StepRecord row mirrors that.
+        steps = await store.list_steps("run-edge")
+        failed = [s for s in steps if s.status is StepStatus.FAILED]
+        assert failed, "expected at least one FAILED step row"
+        assert "AgentExecutionError" in (failed[-1].error or "")
+        # And the inner ValueError text is preserved end-to-end.
+        assert "ValueError" in (failed[-1].error or "")
+
+
 class TestStepRecordTimings:
     async def test_terminal_step_preserves_real_started_at(self) -> None:
         """Terminal records must carry the wall-clock start captured at

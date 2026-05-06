@@ -202,14 +202,22 @@ class WorkflowEngine:
                     log=log,
                 )
                 raise
-            except Exception as exc:  # agents are user code; wrap in AgentExecutionError
+            except Exception as exc:
+                # Agent code is user-supplied. Wrap in `AgentExecutionError`
+                # so callers (the API logger, future Inngest mapper) can
+                # match on a typed handle for "the agent itself raised"
+                # versus the other failure modes (timeout, agent reported
+                # FAILED). Retry budget still applies — we report the
+                # wrapped type in the error string and the log line so
+                # the typed framing survives the catch loop.
                 wrapped = AgentExecutionError(agent.name.value, exc)
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = f"{type(wrapped).__name__}: {wrapped}"
                 log.warning(
                     "workflow.agent_error",
                     attempt=attempt,
-                    exc_type=type(exc).__name__,
-                    error=str(exc),
+                    exc_type=type(wrapped).__name__,
+                    inner_exc_type=type(exc).__name__,
+                    error=str(wrapped),
                 )
                 await self._safe_record(
                     agent,
@@ -219,9 +227,6 @@ class WorkflowEngine:
                     started_at=started_at,
                     log=log,
                 )
-                # Suppress chaining so loggers don't double-report; semantic
-                # info is preserved in `AgentExecutionError.original`.
-                del wrapped
             else:
                 elapsed = (time.perf_counter() - t0) * 1000.0
                 if result.status is StepStatus.SUCCEEDED:

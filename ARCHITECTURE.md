@@ -110,7 +110,7 @@ What happens on each failure mode:
 
 | Failure | Recovery |
 | --- | --- |
-| `agent.search()` raises | wrapped via `AgentExecutionError`, recorded, retried |
+| `agent.search()` raises | wrapped in `AgentExecutionError` (the wrapper's name + the original exception text both land in the StepRecord and the `workflow.agent_error` log line, so callers can match on the typed handle), recorded, retried |
 | `agent.search()` returns `FAILED` | recorded, retried (its own choice — distinct from a raised exception) |
 | `asyncio.wait_for` fires | `AgentTimeoutError`, recorded, retried |
 | `asyncio.CancelledError` | recorded once, then re-raised — cancellation is *not* a retry signal |

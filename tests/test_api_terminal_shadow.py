@@ -16,7 +16,7 @@ import fakeredis.aioredis as fake_aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from research_crew.api import _TerminalShadow, app
+from research_crew.api import _persist_terminal, _TerminalShadow, app
 from research_crew.errors import StoreUnavailableError
 from research_crew.models import AgentName, AgentResult, RunStatus, StepRecord, StepStatus
 from research_crew.store import RedisRunStore, RunStore
@@ -353,6 +353,42 @@ class TestShadowOnTerminalWriteFailure:
         r = await client.get(f"/runs/{run_id}")
         assert r.status_code == 200
         assert r.json()["steps"] == []
+
+
+class TestPersistTerminalNarrowExceptions:
+    """`_persist_terminal` must downgrade only *expected* outage
+    exceptions to the shadow. A serialization or programmer bug should
+    propagate so it gets fixed, not silently masked as if Redis were
+    down.
+    """
+
+    async def test_persist_terminal_does_not_swallow_serialization_bugs(self) -> None:
+        class BugStore:
+            async def put_run(self, run: RunStatus) -> None:
+                # Simulate a programmer bug: not a known store-outage class.
+                raise TypeError("model_dump_json received an unhashable thing")
+
+            async def get_run(self, run_id: str) -> RunStatus | None:  # pragma: no cover
+                return None
+
+            async def append_step(self, _step: object) -> None:  # pragma: no cover
+                pass
+
+            async def list_steps(self, _run_id: str) -> list[StepRecord]:  # pragma: no cover
+                return []
+
+            async def cache_get(self, _key: str) -> AgentResult | None:  # pragma: no cover
+                return None
+
+            async def cache_put(self, _key: str, _result: AgentResult) -> None:  # pragma: no cover
+                pass
+
+        shadow = _TerminalShadow()
+        run = RunStatus(run_id="r-bug", question="q", state=StepStatus.SUCCEEDED)
+        with pytest.raises(TypeError):
+            await _persist_terminal(BugStore(), shadow, run, agent_label="test")
+        # And the shadow must NOT have been used as a fallback.
+        assert "r-bug" not in shadow
 
 
 class TestShadowDoesNotPolluteOnSuccess:

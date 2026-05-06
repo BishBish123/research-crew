@@ -609,16 +609,21 @@ async def _persist_terminal(
     *,
     agent_label: str,
 ) -> None:
-    """Write a terminal RunStatus to the store; on failure stash in the
-    in-process shadow so a subsequent GET still surfaces a terminal state.
+    """Write a terminal RunStatus to the store; on store outage stash in
+    the in-process shadow so a subsequent GET still surfaces a terminal
+    state.
 
-    The shadow is only written on the failure path. A successful put
-    leaves `shadow[run_id]` untouched so happy-path runs never pollute
-    the in-process cache.
+    The shadow path is only for *expected* outage exceptions
+    (`StoreUnavailableError`, `RedisError`). Programmer / serialization
+    bugs propagate to the caller's outer handler so they actually get
+    fixed instead of getting silently downgraded into a shadow write.
+
+    A successful put leaves `shadow[run_id]` untouched so happy-path
+    runs never pollute the in-process cache.
     """
     try:
         await store.put_run(run)
-    except Exception as exc:
+    except (StoreUnavailableError, RedisError) as exc:
         _log.error(
             "api.background_terminal_write_failed",
             run_id=run.run_id,

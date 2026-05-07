@@ -14,15 +14,18 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import redis.asyncio as aioredis
 import structlog
 import typer
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
+from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
@@ -32,9 +35,11 @@ from research_crew.models import (
     ResearchReport,
     ResearchRequest,
     RunStatus,
+    StepRecord,
     StepStatus,
 )
 from research_crew.store import RedisRunStore, RunStore, migrate_run_blob
+from research_crew.streaming import registry as _ws_registry
 from research_crew.synthesizer import StitchSynthesizer
 from research_crew.workflow import WorkflowEngine
 
@@ -893,6 +898,10 @@ async def submit_research(
         _log.warning("api.store_down_on_submit", run_id=run_id, error=str(exc))
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
     _log.info("api.run_submitted", run_id=run_id, question_len=len(payload.question))
+    # Create a per-run broadcast slot in the WS registry so subscribers
+    # that connect before the first step event don't miss anything.
+    # In-process only; see streaming.py for the Redis pub/sub upgrade path.
+    _ws_registry.create(run_id)
     background.add_task(_execute_run, store, _terminal_shadow(request), run_id, payload)
     # Absolute URL so callers behind a proxy / different host can poll
     # without re-deriving the base. ``request.url_for`` resolves the
@@ -995,6 +1004,149 @@ async def _hydrate_steps_best_effort(store: RunStore, run_id: str, run: RunStatu
     # Mutate a copy so a future shadow read still sees the cached entry
     # without the steps populated (cheaper than re-list on every GET).
     return run.model_copy(update={"steps": steps})
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: WS /runs/{run_id}/stream
+# ---------------------------------------------------------------------------
+
+# Default heartbeat cadence for the WS endpoint. Injected as a kwarg so
+# tests can pass a shorter interval without env-var gymnastics.
+_WS_HEARTBEAT_S: float = 15.0
+
+
+def _ws_check_auth(
+    app_state: object,
+    raw_auth_header: str | None,
+    query_token: str | None,
+) -> None:
+    """Enforce bearer-token auth for WebSocket connections.
+
+    WebSocket connections cannot set the ``Authorization`` header from a
+    browser (the WS API does not expose it), so we also accept the token
+    via a ``?token=<value>`` query param. Both paths use constant-time
+    comparison.
+
+    No-ops when ``app.state.api_token`` is unset (open/dev mode).
+    """
+    expected: str | None = getattr(app_state, "api_token", None)
+    if not expected:
+        return
+    # Extract bare token from "Bearer <token>" header value if present.
+    candidate: str | None = None
+    if raw_auth_header:
+        parts = raw_auth_header.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            candidate = parts[1]
+    elif query_token:
+        candidate = query_token
+    if candidate is None or not secrets.compare_digest(candidate, expected):
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+@app.websocket("/runs/{run_id}/stream")
+async def stream_run(
+    run_id: str,
+    ws: WebSocket,
+    authorization: str | None = Query(default=None, alias="token"),
+    _heartbeat_s: float = _WS_HEARTBEAT_S,
+) -> None:
+    """Stream step events for a run via WebSocket.
+
+    **Authentication**: send the bearer token via the ``Authorization:
+    Bearer <token>`` HTTP header *or* via the ``?token=<value>`` query
+    param (the latter is required for browser clients because the WS
+    JavaScript API does not expose request headers).
+
+    **Message types** (all JSON):
+
+    * ``{"type": "snapshot", ...RunStatus fields}`` — sent immediately
+      on connect with the current run state.
+    * ``{"type": "step", ...StepRecord fields}`` — sent for each step
+      event as the workflow executes.
+    * ``{"type": "heartbeat"}`` — sent every 15 s to keep the connection
+      alive through load-balancer idle timeouts.
+    * ``{"type": "done"}`` — sent when the run reaches a terminal state
+      (succeeded / failed). The server closes the connection after this
+      message.
+
+    **Close codes**: 1008 (Policy Violation) for auth failures, 1011
+    (Internal Error) for unexpected server errors, 1000 (Normal) on
+    clean completion.
+    """
+    # --- auth ---
+    # The ``authorization`` Query param carries the raw header value when
+    # sent as a WS upgrade header; for browser query-param auth it carries
+    # just the token. The helper resolves either form.
+    raw_auth = ws.headers.get("authorization")
+    try:
+        _ws_check_auth(ws.app.state, raw_auth, authorization)
+    except HTTPException:
+        await ws.close(code=1008, reason="unauthorized")
+        return
+
+    await ws.accept()
+
+    # --- initial snapshot ---
+    store = getattr(ws.app.state, "store", None)
+    if store is None:
+        await ws.close(code=1011, reason="store not initialised")
+        return
+
+    try:
+        run = await store.get_run(run_id)
+    except Exception as exc:
+        _log.warning("ws.stream_get_run_failed", run_id=run_id, error=str(exc))
+        await ws.close(code=1011, reason="store unavailable")
+        return
+
+    if run is None:
+        await ws.close(code=1008, reason=f"run {run_id} not found")
+        return
+
+    snapshot_payload = run.model_dump(mode="json")
+    snapshot_payload["type"] = "snapshot"
+    await ws.send_json(snapshot_payload)
+
+    # If the run is already terminal, close immediately.
+    if run.state in _TERMINAL_STATES:
+        await ws.send_json({"type": "done"})
+        await ws.close(code=1000)
+        return
+
+    # --- subscribe to step events ---
+    q = _ws_registry.subscribe(run_id)
+    try:
+        while True:
+            try:
+                step = await asyncio.wait_for(q.get(), timeout=_heartbeat_s)
+            except TimeoutError:
+                # No event arrived within the heartbeat window; send a
+                # keepalive ping so load-balancers don't drop idle connections.
+                try:
+                    await ws.send_json({"type": "heartbeat"})
+                except WebSocketDisconnect:
+                    break
+                continue
+
+            # None sentinel → run reached terminal state.
+            if step is None:
+                try:
+                    await ws.send_json({"type": "done"})
+                    await ws.close(code=1000)
+                except WebSocketDisconnect:
+                    pass
+                break
+
+            # Real step event.
+            event = step.model_dump(mode="json")
+            event["type"] = "step"
+            try:
+                await ws.send_json(event)
+            except WebSocketDisconnect:
+                break
+    finally:
+        _ws_registry.unsubscribe(run_id, q)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,9 +1276,15 @@ async def _run_workflow_and_persist(
         wanted = set(payload.agents)
         agents = [a for a in agents if a.name in wanted]
     agent_count = len(agents)
+
+    # Wrap record_step so every step event is also broadcast to WS subscribers.
+    async def _record_and_publish(step: StepRecord) -> None:
+        await store.append_step(step)
+        _ws_registry.publish(run_id, step)
+
     engine = WorkflowEngine(
         run_id=run_id,
-        record_step=store.append_step,
+        record_step=_record_and_publish,
         cache_get=store.cache_get,
         cache_put=store.cache_put,
     )
@@ -1166,6 +1324,7 @@ async def _run_workflow_and_persist(
             failed_agents=failed_agents,
             note="run_record_missing_at_finalization",
         )
+        _ws_registry.teardown(run_id)
         return agent_count, succeeded_agents, failed_agents
     finished.state = (
         StepStatus.FAILED
@@ -1184,6 +1343,7 @@ async def _run_workflow_and_persist(
         succeeded_agents=succeeded_agents,
         failed_agents=failed_agents,
     )
+    _ws_registry.teardown(run_id)
     return agent_count, succeeded_agents, failed_agents
 
 
@@ -1247,6 +1407,7 @@ async def _execute_run(
             failed_agents=max(failed_agents, agent_count - succeeded_agents),
             note="cancelled_during_shutdown",
         )
+        _ws_registry.teardown(run_id)
         raise
     except Exception as exc:
         _log.error(
@@ -1304,6 +1465,7 @@ async def _execute_run(
             failed_agents=max(failed_agents, agent_count - succeeded_agents),
             note="exception_path",
         )
+        _ws_registry.teardown(run_id)
     finally:
         # Belt-and-braces: every successful path already cancelled the
         # heartbeat above, but if a new exception path is added later
@@ -1339,6 +1501,24 @@ def _emit_run_completed(
         payload["note"] = note
     _log.info("api.run_completed", **payload)
 
+
+# ---------------------------------------------------------------------------
+# Static frontend — mounted AFTER all API routes so API paths take priority.
+# Serves index.html at / and the JS/CSS assets at /static/*.
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = Path(__file__).parent / "api" / "static"
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(_STATIC_DIR)),
+    name="static",
+)
+app.mount(
+    "/",
+    StaticFiles(directory=str(_STATIC_DIR), html=True),
+    name="frontend",
+)
 
 # ---------------------------------------------------------------------------
 # CLI entry: `research-api`

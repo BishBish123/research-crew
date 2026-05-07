@@ -1,0 +1,55 @@
+name: docker
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  docker-build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --tag research-crew:ci .
+
+      - name: Run container (memory store, no Redis)
+        run: |
+          docker run --detach \
+            --name research-crew-smoke \
+            --publish 8000:8000 \
+            --env RESEARCH_CREW_STORE=memory \
+            --env RESEARCH_DEV_MODE=1 \
+            research-crew:ci
+
+      - name: Poll /health until ready (60s timeout)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Service healthy after ${i}s"
+              curl -sS http://localhost:8000/health | jq .
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ERROR: /health did not respond within 60s" >&2
+          docker logs research-crew-smoke >&2
+          exit 1
+
+      - name: Verify /health returns status ok
+        run: |
+          STATUS=$(curl -sS http://localhost:8000/health | jq -r '.status')
+          if [[ "$STATUS" != "ok" ]]; then
+            echo "ERROR: /health returned status='$STATUS', expected 'ok'" >&2
+            exit 1
+          fi
+          echo "Health check passed: status=$STATUS"
+
+      - name: Stop and remove container
+        if: always()
+        run: docker rm -f research-crew-smoke || true

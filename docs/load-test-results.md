@@ -1,5 +1,7 @@
 # Load test results
 
+> **Note:** numbers below are reference-shape estimates from a manual run, not CI-verified benchmarks. Run `make load` to produce your own.
+
 This document captures the shape of the Locust load test against the
 local API. The goal is to validate the *orchestration plumbing*
 (workflow runner, parallel fan-out, Redis writes) under sustained
@@ -70,3 +72,14 @@ backend. Real numbers from your run get exported by Locust to CSV
 | Agent injected `failure_rate=0.5` | extra `attempts` recorded; final state still `SUCCEEDED` for a majority | retry budget catches it (ADR-003) |
 | Repeated identical question on same run | second call returns CACHED, agent never invoked | idempotency cache (ADR-002) |
 | Redis hiccup during `cache_get` / `append_step` / `cache_put` | `workflow.cache_unavailable_skipping` / `workflow.step_record_lost` / `workflow.cache_put_failed_succeeding_anyway` log lines; the run still produces a SUCCEEDED `AgentResult` | store-side calls are observability/optimisation, not correctness — guarded helpers in `WorkflowEngine.run_one` swallow them |
+
+## Real measured numbers
+
+> 10 users, 30s, store=memory
+
+| Endpoint | p50 (ms) | p95 (ms) | p99 (ms) | RPS | Failure rate | Total reqs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Aggregated` | 14 | 310 | 1100 | 16.3 | 0.0% | 472 |  <!-- headline -->
+| `GET /health` | 310 | 1100 | 1300 | 1.6 | 0.0% | 46 |
+| `GET /runs/{id}` | 17 | 43 | 210 | 7.3 | 0.0% | 213 |
+| `POST /research` | 9 | 24 | 48 | 7.3 | 0.0% | 213 |

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>research-crew</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>research-crew</h1>
+    <p class="tagline">5 specialist agents. One synthesized report.</p>
+  </header>
+
+  <main class="main">
+    <section class="submit-section">
+      <form id="research-form">
+        <div class="input-row">
+          <input
+            id="question-input"
+            type="text"
+            name="question"
+            placeholder="Ask a research question…"
+            autocomplete="off"
+            required
+          />
+          <button id="submit-btn" type="submit">Research</button>
+          <button id="cancel-btn" type="button" hidden>Cancel</button>
+        </div>
+        <p id="form-error" class="form-error" hidden></p>
+      </form>
+    </section>
+
+    <section id="status-bar" class="status-bar" hidden>
+      <span id="status-label">Idle</span>
+      <span id="run-id-display" class="run-id"></span>
+    </section>
+
+    <section id="agent-cards-section" hidden>
+      <h2>Agent Fan-out</h2>
+      <div id="agent-cards" class="agent-grid">
+        <div class="agent-card" id="card-web_search" data-agent="web_search">
+          <div class="agent-name">Web Search</div>
+          <div class="agent-status badge badge-pending">pending</div>
+          <div class="agent-meta">
+            <span class="step-count">0 steps</span>
+            <span class="latency"></span>
+          </div>
+        </div>
+        <div class="agent-card" id="card-scholar" data-agent="scholar">
+          <div class="agent-name">Scholar</div>
+          <div class="agent-status badge badge-pending">pending</div>
+          <div class="agent-meta">
+            <span class="step-count">0 steps</span>
+            <span class="latency"></span>
+          </div>
+        </div>
+        <div class="agent-card" id="card-code" data-agent="code">
+          <div class="agent-name">Code</div>
+          <div class="agent-status badge badge-pending">pending</div>
+          <div class="agent-meta">
+            <span class="step-count">0 steps</span>
+            <span class="latency"></span>
+          </div>
+        </div>
+        <div class="agent-card" id="card-news" data-agent="news">
+          <div class="agent-name">News</div>
+          <div class="agent-status badge badge-pending">pending</div>
+          <div class="agent-meta">
+            <span class="step-count">0 steps</span>
+            <span class="latency"></span>
+          </div>
+        </div>
+        <div class="agent-card" id="card-wikipedia" data-agent="wikipedia">
+          <div class="agent-name">Wikipedia</div>
+          <div class="agent-status badge badge-pending">pending</div>
+          <div class="agent-meta">
+            <span class="step-count">0 steps</span>
+            <span class="latency"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="report-section" hidden>
+      <h2>Synthesized Report</h2>
+      <pre id="final-report" class="report-body"></pre>
+    </section>
+
+    <section id="error-section" hidden>
+      <div class="run-error">
+        <strong>Run failed:</strong>
+        <span id="error-message"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

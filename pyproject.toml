@@ -40,8 +40,25 @@ research-api = "research_crew.api:main"
 research = "research_crew.cli:app"
 
 [project.optional-dependencies]
+real = [
+    # httpx is already in base dependencies; listed here as a reminder that
+    # real search adapters and the Langfuse SDK both rely on it.
+    "httpx>=0.27",
+    # Langfuse tracing adapter. Latest: 4.5.1 (verified 2026-05-06 via PyPI).
+    "langfuse>=2.50",
+    # Inngest durable workflow engine. Latest: 0.5.18 (verified 2026-05-06 via PyPI).
+    # Required for --use-inngest CLI flag and the InngestWorkflow path.
+    # Not in base deps — the hand-rolled WorkflowEngine is the default.
+    "inngest>=0.4",
+]
 load = [
     "locust>=2.30",
+]
+embed = [
+    # Real sentence embeddings for PgVectorSemanticDedup (cross-run semantic dedup).
+    # Soft-fail: if absent the module falls back to a deterministic hash-based fake encoder.
+    # Model used: all-MiniLM-L6-v2 (384 dims); downloaded on first use (~90 MB).
+    "sentence-transformers>=3.0",
 ]
 dev = [
     "pytest>=8.2",
@@ -74,6 +91,14 @@ ignore = ["PLR0913", "PLR2004", "E501", "S101", "S603", "S607"]
 "tests/**" = ["PLR2004", "S101", "ASYNC"]
 "src/research_crew/cli.py" = ["B008"]
 "src/research_crew/api.py" = ["B008"]
+# Deferred import inside __init__ is intentional (soft-fail SDK import pattern).
+"src/research_crew/observability/langfuse.py" = ["PLC0415"]
+# Deferred inngest import is intentional (soft-fail — inngest is an optional [real] dep).
+"src/research_crew/workflow_inngest.py" = ["PLC0415"]
+# Deferred asyncpg/sentence-transformers imports are intentional (soft-fail optional deps).
+"src/research_crew/dedup/pgvector.py" = ["PLC0415"]
+# Deferred pgvector import in factory is intentional (only when RESEARCH_PG_DSN is set).
+"src/research_crew/dedup/__init__.py" = ["PLC0415"]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -92,6 +117,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: tests requiring a real Redis at REDIS_URL",
-    "slow: tests > ~1s",
+    "slow: tests that take more than ~1s",
 ]
 filterwarnings = ["error", "ignore::DeprecationWarning"]

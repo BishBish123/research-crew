@@ -1,0 +1,60 @@
+{
+  "_source": "https://docs.tavily.com/documentation/api-reference/endpoint/search",
+  "_verified": "2026-05-06",
+  "_notes": "Required: query, results, images, response_time, answer. results[].score and results[].raw_content are optional.",
+  "query": "machine learning transformers",
+  "answer": "Transformers are a type of deep learning model architecture introduced in 2017 that rely on self-attention mechanisms.",
+  "images": [],
+  "results": [
+    {
+      "title": "Attention Is All You Need - Vaswani et al.",
+      "url": "https://arxiv.org/abs/1706.03762",
+      "content": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks. We propose a new simple network architecture, the Transformer, based solely on attention mechanisms.",
+      "score": 0.92315,
+      "raw_content": null,
+      "favicon": "https://arxiv.org/favicon.ico",
+      "images": []
+    },
+    {
+      "title": "BERT: Pre-training of Deep Bidirectional Transformers",
+      "url": "https://arxiv.org/abs/1810.04805",
+      "content": "We introduce BERT, a new language representation model designed to pre-train deep bidirectional representations from unlabeled text by jointly conditioning on both left and right context.",
+      "score": 0.88741,
+      "raw_content": "BERT stands for Bidirectional Encoder Representations from Transformers.",
+      "favicon": "https://arxiv.org/favicon.ico",
+      "images": []
+    },
+    {
+      "title": "The Illustrated Transformer – Jay Alammar",
+      "url": "https://jalammar.github.io/illustrated-transformer/",
+      "content": "A visual guide to the transformer architecture and how attention mechanisms work in modern NLP models.",
+      "score": 0.81025,
+      "raw_content": null,
+      "favicon": "https://jalammar.github.io/favicon.ico",
+      "images": []
+    },
+    {
+      "title": "Hugging Face Transformers Documentation",
+      "url": "https://huggingface.co/docs/transformers/index",
+      "content": "State-of-the-art machine learning library providing thousands of pretrained models to perform tasks on text, images, and audio.",
+      "score": 0.79430,
+      "raw_content": null,
+      "favicon": "https://huggingface.co/favicon.ico",
+      "images": []
+    },
+    {
+      "title": "Transformers: Explained | Google Cloud",
+      "url": "https://cloud.google.com/learn/what-are-transformers-in-machine-learning",
+      "content": "Transformers are a type of neural network architecture that transforms or changes an input sequence into an output sequence.",
+      "score": 0.74812,
+      "raw_content": null,
+      "favicon": "https://cloud.google.com/favicon.ico",
+      "images": []
+    }
+  ],
+  "response_time": 1.23,
+  "usage": {
+    "credits": 5
+  },
+  "request_id": "req-tavily-abc123def456"
+}

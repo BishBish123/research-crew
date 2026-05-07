@@ -23,11 +23,28 @@ version is older are migrated by ``migrate_run_blob`` /
 Designed to drop in next to a real Inngest deployment: the run / step
 keys mirror what a workflow engine would write, so a future commit can
 replace this with `inngest.step.run(...)` without touching the API.
+
+Store backend selection
+-----------------------
+The ``make_run_store()`` factory reads ``RESEARCH_CREW_STORE`` from the
+environment:
+
+* ``hash`` (default) → ``RedisRunStore`` — hash + list keys, original
+  implementation.
+* ``streams``        → ``RedisStreamRunStore`` — Redis Streams
+  (XADD / XREADGROUP / XACK / XPENDING) for the step audit log.
+* ``memory``         → ``InMemoryRunStore`` — in-process, tests only.
+* ``postgres``       → ``PostgresRunStore`` — Postgres / Neon durable
+  storage; reads ``RESEARCH_PG_DSN`` env var.
+
+For ``hash`` and ``streams``, the factory also reads ``REDIS_URL``
+(default ``redis://localhost:6379/0``) to build the async client.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Protocol
 
 import redis.asyncio as aioredis
@@ -275,13 +292,64 @@ class InMemoryRunStore:
         self._cache[dedup_key] = result
 
 
+def make_run_store() -> RunStore:
+    """Factory that selects a ``RunStore`` backend via ``RESEARCH_CREW_STORE``.
+
+    Values:
+    * ``hash`` (default) — ``RedisRunStore`` backed by hash + list keys.
+    * ``streams``        — ``RedisStreamRunStore`` backed by Redis Streams.
+    * ``memory``         — ``InMemoryRunStore`` (in-process, tests only).
+    * ``postgres``       — ``PostgresRunStore`` backed by Postgres/Neon;
+                           reads ``RESEARCH_PG_DSN`` (default
+                           ``postgresql://research:research@localhost:5432/research``).
+                           Returns the store object without calling ``setup()`` —
+                           callers must invoke ``await store.setup()`` at lifespan.
+                           Requires ``asyncpg`` in the virtualenv.
+
+    For Redis-backed stores the client is created from ``REDIS_URL``
+    (default ``redis://localhost:6379/0``).
+    """
+    backend = os.environ.get("RESEARCH_CREW_STORE", "hash").lower().strip()
+    if backend == "memory":
+        return InMemoryRunStore()
+    if backend == "postgres":
+        from research_crew.store.postgres import PostgresRunStore  # noqa: PLC0415
+
+        dsn = os.environ.get(
+            "RESEARCH_PG_DSN",
+            "postgresql://research:research@localhost:5432/research",
+        )
+        # The pool is created lazily on the first call to ``store.setup()``.
+        # This avoids synchronous event-loop gymnastics in the factory and
+        # lets the caller (API lifespan) await the setup in async context.
+        return PostgresRunStore(dsn=dsn)
+    if backend in ("hash", "streams"):
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        prefix = os.environ.get("RESEARCH_REDIS_PREFIX", DEFAULT_REDIS_PREFIX)
+        client: aioredis.Redis = aioredis.from_url(redis_url, decode_responses=True)
+        if backend == "streams":
+            from research_crew.store.redis_streams import (  # noqa: PLC0415
+                RedisStreamRunStore,
+            )
+
+            return RedisStreamRunStore(client, prefix=prefix)
+        return RedisRunStore(client, prefix=prefix)
+    raise ValueError(
+        f"Unknown RESEARCH_CREW_STORE value {backend!r}. "
+        "Expected one of: 'hash', 'streams', 'memory', 'postgres'."
+    )
+
+
 __all__ = [
     "AgentResult",
     "InMemoryRunStore",
+    "PostgresRunStore",
     "RedisRunStore",
     "ResearchReport",
     "RunStatus",
     "RunStore",
     "StepRecord",
     "StepStatus",
+    "make_run_store",
+    "migrate_run_blob",
 ]

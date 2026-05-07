@@ -1,0 +1,72 @@
+{
+  "_source": "https://exa.ai/docs/reference/search",
+  "_verified": "2026-05-06",
+  "_notes": "Same shape as exa_search_response.json but produced when category='research paper' is sent in the POST body. URLs are academic sources (arxiv, pubmed, nature, etc). score is optional and may be absent on some entries.",
+  "requestId": "req-exa-paper-4c8d1f7e",
+  "searchType": "neural",
+  "results": [
+    {
+      "id": "https://arxiv.org/abs/2005.14165",
+      "url": "https://arxiv.org/abs/2005.14165",
+      "title": "Language Models are Few-Shot Learners (GPT-3)",
+      "publishedDate": "2020-05-28T00:00:00.000Z",
+      "author": "Tom B. Brown et al.",
+      "score": 0.9612312,
+      "text": "We demonstrate that scaling language models greatly improves task-agnostic, few-shot performance, sometimes even reaching competitiveness with prior state-of-the-art fine-tuning approaches. GPT-3 has 175 billion parameters and achieves strong performance on many NLP benchmarks.",
+      "highlights": [
+        "scaling language models greatly improves task-agnostic, few-shot performance",
+        "GPT-3 has 175 billion parameters"
+      ],
+      "highlightScores": [0.9543, 0.9212],
+      "image": null,
+      "favicon": "https://arxiv.org/favicon.ico"
+    },
+    {
+      "id": "https://www.nature.com/articles/s41586-021-03819-2",
+      "url": "https://www.nature.com/articles/s41586-021-03819-2",
+      "title": "Highly accurate protein structure prediction with AlphaFold",
+      "publishedDate": "2021-07-15T00:00:00.000Z",
+      "author": "John Jumper et al.",
+      "score": 0.9234567,
+      "text": "Proteins are essential to life and understanding their structure would unlock progress in drug discovery. We present AlphaFold, a novel machine learning approach that achieves atomic accuracy in protein structure prediction.",
+      "highlights": [
+        "novel machine learning approach that achieves atomic accuracy in protein structure prediction"
+      ],
+      "highlightScores": [0.9512],
+      "image": null,
+      "favicon": "https://www.nature.com/favicon.ico"
+    },
+    {
+      "id": "https://arxiv.org/abs/2302.13971",
+      "url": "https://arxiv.org/abs/2302.13971",
+      "title": "LLaMA: Open and Efficient Foundation Language Models",
+      "publishedDate": "2023-02-27T00:00:00.000Z",
+      "author": "Hugo Touvron et al.",
+      "score": null,
+      "text": "We introduce LLaMA, a collection of foundation language models ranging from 7B to 65B parameters. We train these models on trillions of tokens and show that it is possible to train state-of-the-art models using publicly available datasets exclusively.",
+      "highlights": [
+        "foundation language models ranging from 7B to 65B parameters"
+      ],
+      "highlightScores": [0.8934],
+      "image": null,
+      "favicon": "https://arxiv.org/favicon.ico"
+    },
+    {
+      "id": "https://pubmed.ncbi.nlm.nih.gov/32468613/",
+      "url": "https://pubmed.ncbi.nlm.nih.gov/32468613/",
+      "title": "Transformer models for medical image segmentation",
+      "publishedDate": "2020-06-01T00:00:00.000Z",
+      "author": "Various",
+      "score": 0.8712345,
+      "text": "Medical image segmentation using transformer-based architectures has demonstrated superior performance over convolutional approaches for 3D volumetric data.",
+      "highlights": [],
+      "highlightScores": [],
+      "image": null,
+      "favicon": "https://pubmed.ncbi.nlm.nih.gov/favicon.ico"
+    }
+  ],
+  "costDollars": {
+    "total": 0.006,
+    "search": 0.006
+  }
+}

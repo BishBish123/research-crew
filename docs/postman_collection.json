@@ -1,0 +1,118 @@
+{
+  "info": {
+    "_postman_id": "997bf8d7-eacb-4661-9525-89d497b716a5",
+    "name": "research-crew",
+    "description": "5 specialist agents fan out in parallel via a Redis-backed durable workflow with idempotent step semantics + bounded exponential-backoff retries; results merge through a Synthesizer into a single citation-grounded report.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{API_TOKEN}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "API_TOKEN",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Liveness + worker-load probe.\n\nAdds two workload-shape fields beyond the basic Redis ping:\n\n* ``active_runs`` \u2014 count of run records whose state is RUNNING,\n  derived via a SCAN over `{prefix}:run:*` keys (skipping the\n  `:steps` lists). Falls back to ``None`` if the count couldn't be\n  computed; the probe still returns 200 in that case so a brief\n  keyspace hiccup doesn't flap a load-balancer health check.\n* ``shadow_size`` \u2014 number of terminal RunStatus entries currently\n  held in the in-process shadow. Non-zero means the bg task has\n  been recovering from a store outage; operators want to see this."
+      },
+      "response": []
+    },
+    {
+      "name": "Submit Research",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/research",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "research"
+          ]
+        },
+        "description": "Enqueue a research run. Returns immediately with the run_id.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"string\",\n  \"agents\": null\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Run",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/runs/:run_id",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "runs",
+            ":run_id"
+          ],
+          "variable": [
+            {
+              "key": "run_id",
+              "value": "<run_id>",
+              "description": ""
+            }
+          ]
+        },
+        "description": "Return the latest known state for `run_id`.\n\nLookup precedence (the shadow exists for the bg-task store-outage path\nwhere the run *did* finish but the store rejected our terminal write):\n\n1. Store has a terminal record (SUCCEEDED/FAILED) \u2192 return it.\n2. Store has a still-RUNNING record but the shadow has a terminal one\n   \u2192 return the shadow (the bg task hit a store outage and recovered\n   to in-process state, while a stale RUNNING blob lingers in Redis).\n3. Store says 404 but the shadow has it \u2192 return the shadow.\n4. Store outage \u2192 return the shadow if present, else 503."
+      },
+      "response": []
+    }
+  ]
+}

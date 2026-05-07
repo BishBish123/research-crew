@@ -1,0 +1,506 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "research-crew",
+    "summary": "Concurrent multi-agent research service.",
+    "description": "5 specialist agents fan out in parallel via a Redis-backed durable workflow with idempotent step semantics + bounded exponential-backoff retries; results merge through a Synthesizer into a single citation-grounded report.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "description": "Liveness + worker-load probe.\n\nAdds two workload-shape fields beyond the basic Redis ping:\n\n* ``active_runs`` \u2014 count of run records whose state is RUNNING,\n  derived via a SCAN over `{prefix}:run:*` keys (skipping the\n  `:steps` lists). Falls back to ``None`` if the count couldn't be\n  computed; the probe still returns 200 in that case so a brief\n  keyspace hiccup doesn't flap a load-balancer health check.\n* ``shadow_size`` \u2014 number of terminal RunStatus entries currently\n  held in the in-process shadow. Non-zero means the bg task has\n  been recovering from a store outage; operators want to see this.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Health Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/research": {
+      "post": {
+        "summary": "Submit Research",
+        "description": "Enqueue a research run. Returns immediately with the run_id.",
+        "operationId": "submit_research_research_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Submit Research Research Post"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error."
+          },
+          "429": {
+            "description": "Rate limit exceeded."
+          },
+          "503": {
+            "description": "Run store unavailable."
+          }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "summary": "Get Run",
+        "description": "Return the latest known state for `run_id`.\n\nLookup precedence (the shadow exists for the bg-task store-outage path\nwhere the run *did* finish but the store rejected our terminal write):\n\n1. Store has a terminal record (SUCCEEDED/FAILED) \u2192 return it.\n2. Store has a still-RUNNING record but the shadow has a terminal one\n   \u2192 return the shadow (the bg task hit a store outage and recovered\n   to in-process state, while a stale RUNNING blob lingers in Redis).\n3. Store says 404 but the shadow has it \u2192 return the shadow.\n4. Store outage \u2192 return the shadow if present, else 503.",
+        "operationId": "get_run_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error."
+          },
+          "429": {
+            "description": "Rate limit exceeded."
+          },
+          "503": {
+            "description": "Run store unavailable."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentName": {
+        "type": "string",
+        "enum": [
+          "web_search",
+          "scholar",
+          "code",
+          "news",
+          "wikipedia"
+        ],
+        "title": "AgentName"
+      },
+      "AgentResult": {
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/AgentName"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/Citation"
+            },
+            "type": "array",
+            "title": "Citations"
+          },
+          "elapsed_ms": {
+            "type": "number",
+            "title": "Elapsed Ms",
+            "default": 0.0
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "default": 1
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "agent",
+          "status",
+          "summary"
+        ],
+        "title": "AgentResult",
+        "description": "Output of one specialist agent."
+      },
+      "Citation": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "snippet": {
+            "type": "string",
+            "title": "Snippet",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "url"
+        ],
+        "title": "Citation",
+        "description": "One source the synthesizer references in the final report."
+      },
+      "ErrorDetail": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorDetail",
+        "description": "Standard error body shape for 4xx / 5xx responses.\n\nDeclared here so every protected route can reference it in its\n``responses`` dict, making the OpenAPI schema emit a typed model\nreference instead of a plain ``{}`` schema for error responses."
+      },
+      "ResearchReport": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/Citation"
+            },
+            "type": "array",
+            "title": "Citations"
+          },
+          "agent_results": {
+            "items": {
+              "$ref": "#/components/schemas/AgentResult"
+            },
+            "type": "array",
+            "title": "Agent Results"
+          },
+          "elapsed_ms": {
+            "type": "number",
+            "title": "Elapsed Ms"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "question",
+          "summary",
+          "citations",
+          "agent_results",
+          "elapsed_ms"
+        ],
+        "title": "ResearchReport",
+        "description": "The synthesizer's final output."
+      },
+      "ResearchRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Question"
+          },
+          "agents": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AgentName"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "ResearchRequest"
+      },
+      "RunStatus": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "state": {
+            "$ref": "#/components/schemas/StepStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/StepRecord"
+            },
+            "type": "array",
+            "title": "Steps"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResearchReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total_latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Latency Ms"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "schema_version": {
+            "type": "integer",
+            "title": "Schema Version",
+            "default": 1
+          },
+          "abandoned_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Abandoned At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "question",
+          "state"
+        ],
+        "title": "RunStatus",
+        "description": "Runtime status snapshot for `GET /runs/{run_id}`."
+      },
+      "StepRecord": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "agent": {
+            "$ref": "#/components/schemas/AgentName"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepStatus"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "schema_version": {
+            "type": "integer",
+            "title": "Schema Version",
+            "default": 1
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "agent",
+          "status",
+          "attempts",
+          "started_at"
+        ],
+        "title": "StepRecord",
+        "description": "Persisted record of one workflow step \u2014 what was attempted, when, how it ended."
+      },
+      "StepStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "failed",
+          "cached"
+        ],
+        "title": "StepStatus"
+      }
+    }
+  }
+}

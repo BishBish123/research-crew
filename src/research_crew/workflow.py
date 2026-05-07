@@ -33,6 +33,7 @@ import structlog
 from research_crew.agents import Agent
 from research_crew.errors import AgentExecutionError, AgentTimeoutError
 from research_crew.models import AgentResult, StepRecord, StepStatus
+from research_crew.observability.langfuse import LangfuseTracer, NullTracer, RunHandle, make_tracer
 
 _log = structlog.get_logger(__name__)
 
@@ -68,6 +69,14 @@ class WorkflowEngine:
     record_step: Callable[[StepRecord], Awaitable[None]] | None = None
     cache_get: Callable[[str], Awaitable[AgentResult | None]] | None = None
     cache_put: Callable[[str, AgentResult], Awaitable[None]] | None = None
+    # Langfuse tracer — defaults to the env-gated factory so the engine
+    # traces automatically when LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
+    # are set, and is a no-op otherwise. Tests may inject a NullTracer
+    # or a mock directly.
+    tracer: LangfuseTracer | NullTracer | None = None
+    # Active trace handle, set by run_parallel() so _record() can emit
+    # child spans against the right trace context.
+    _run_handle: RunHandle | None = field(default=None, repr=False)
     # Per-dedup-key locks turn the read-then-write idempotency check into
     # an atomic critical section: two concurrent `run_one` calls with the
     # same key serialize, the loser observes the cache hit, and the agent
@@ -268,8 +277,29 @@ class WorkflowEngine:
         )
 
     async def run_parallel(self, agents: list[Agent], question: str) -> list[AgentResult]:
-        """Fan out to every agent concurrently. Partial failure does not abort."""
-        return await asyncio.gather(*(self.run_one(a, question) for a in agents))
+        """Fan out to every agent concurrently. Partial failure does not abort.
+
+        Wraps the full fan-out in a Langfuse trace when a live tracer is
+        configured. The tracer is no-op by default (no env vars → no side
+        effects). Each per-step record call also forwards to the tracer via
+        ``_record`` so every agent attempt appears as a child span.
+        """
+        # Resolve tracer lazily: use the injected instance when present,
+        # otherwise call the factory once and cache it on self so repeated
+        # run_parallel calls on the same engine share a single tracer.
+        if self.tracer is None:
+            self.tracer = make_tracer()
+        tracer = self.tracer
+        handle: RunHandle = tracer.start_run(question)
+        self._run_handle = handle
+        try:
+            results = await asyncio.gather(*(self.run_one(a, question) for a in agents))
+        except Exception:
+            tracer.finish_run(handle, "failed")
+            raise
+        terminal = "failed" if all(r.status is StepStatus.FAILED for r in results) else "succeeded"
+        tracer.finish_run(handle, terminal)
+        return results
 
     # ---------- helpers ----------
 
@@ -287,23 +317,30 @@ class WorkflowEngine:
         error: str | None = None,
         started_at: datetime | None = None,
     ) -> None:
-        if self.record_step is None:
-            return
         # Preserve the real start time captured by `run_one` so terminal
         # records report a positive duration; fall back to `now` only if
         # a caller invokes `_record` directly without a start time.
         start = started_at if started_at is not None else datetime.now(UTC)
-        await self.record_step(
-            StepRecord(
-                run_id=self.run_id,
-                agent=agent.name,
-                status=status,
-                attempts=attempt,
-                started_at=start,
-                finished_at=datetime.now(UTC) if status is not StepStatus.RUNNING else None,
-                error=error,
-            )
+        step = StepRecord(
+            run_id=self.run_id,
+            agent=agent.name,
+            status=status,
+            attempts=attempt,
+            started_at=start,
+            finished_at=datetime.now(UTC) if status is not StepStatus.RUNNING else None,
+            error=error,
         )
+        if self.record_step is not None:
+            await self.record_step(step)
+        # Forward terminal step records to the Langfuse tracer so every
+        # agent attempt appears as a child span. Only emit on terminal
+        # statuses (not RUNNING) to avoid creating half-open spans.
+        if (
+            self.tracer is not None
+            and self._run_handle is not None
+            and status is not StepStatus.RUNNING
+        ):
+            self.tracer.record_step(self._run_handle, step)
 
     async def _safe_cache_get(
         self, dedup_key: str, log: structlog.stdlib.BoundLogger

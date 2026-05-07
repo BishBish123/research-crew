@@ -1,0 +1,67 @@
+{
+  "_source": "https://api-dashboard.search.brave.com/app/documentation/web-search/responses",
+  "_verified": "2026-05-06",
+  "_notes": "Web endpoint returns results under web.results. description is optional. extra_snippets optional array of up to 5 extra excerpts.",
+  "query": {
+    "original": "machine learning transformers",
+    "more_results_available": true
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Transformers in Machine Learning - A Complete Guide",
+        "url": "https://www.ibm.com/topics/transformers-in-machine-learning",
+        "description": "Transformers are a type of neural network architecture designed to handle sequential data and have become the dominant approach in NLP tasks.",
+        "age": "3 months ago",
+        "language": "en",
+        "family_friendly": true,
+        "extra_snippets": [
+          "The transformer model was introduced in the paper Attention Is All You Need in 2017.",
+          "Self-attention allows the model to look at other words in the input sequence when encoding a specific word."
+        ],
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "ibm.com",
+          "hostname": "www.ibm.com",
+          "favicon": "https://www.ibm.com/favicon.ico",
+          "path": "› topics › transformers-in-machine-learning"
+        }
+      },
+      {
+        "title": "What Are Transformers? - NVIDIA Developer",
+        "url": "https://developer.nvidia.com/blog/what-are-transformers/",
+        "description": "NVIDIA explains the transformer architecture and why it revolutionized deep learning for NLP and beyond.",
+        "age": "6 months ago",
+        "language": "en",
+        "family_friendly": true,
+        "extra_snippets": [
+          "Transformers power the latest generation of large language models like GPT-4 and Gemini."
+        ],
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "developer.nvidia.com",
+          "hostname": "developer.nvidia.com",
+          "favicon": "https://developer.nvidia.com/favicon.ico",
+          "path": "› blog › what-are-transformers"
+        }
+      },
+      {
+        "title": "Hugging Face Transformers Library",
+        "url": "https://huggingface.co/docs/transformers/index",
+        "description": "The HuggingFace Transformers library provides thousands of pretrained transformer-based models for NLP, vision, and audio.",
+        "age": "1 week ago",
+        "language": "en",
+        "family_friendly": true,
+        "extra_snippets": [],
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "huggingface.co",
+          "hostname": "huggingface.co",
+          "favicon": "https://huggingface.co/favicon.ico",
+          "path": "› docs › transformers"
+        }
+      }
+    ]
+  }
+}

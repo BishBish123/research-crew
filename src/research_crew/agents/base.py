@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from research_crew.agents.real import BraveAgent, ExaAgent, TavilyAgent
 from research_crew.models import AgentName, AgentResult, Citation, StepStatus
 
 
@@ -88,5 +90,29 @@ def _mock_citations(name: AgentName, question: str) -> list[Citation]:
 
 
 def default_agents(*, latency_ms: float = 50.0, failure_rate: float = 0.0) -> list[Agent]:
-    """One MockAgent per AgentName, configured uniformly."""
-    return [MockAgent(name=n, latency_ms=latency_ms, failure_rate=failure_rate) for n in AgentName]
+    """Return one agent per AgentName slot (always 5).
+
+    Slot mapping
+    ------------
+    * WEB_SEARCH → TavilyAgent (generic web search) when ``TAVILY_API_KEY`` is set; else MockAgent.
+    * NEWS       → BraveAgent(endpoint="news") (Brave /res/v1/news/search) when ``BRAVE_API_KEY``
+                   is set; else MockAgent.
+    * SCHOLAR    → ExaAgent(category="research paper") (Exa filtered to academic sources) when
+                   ``EXA_API_KEY`` is set; else MockAgent.
+    * CODE       → MockAgent (no real adapter yet).
+    * WIKIPEDIA  → MockAgent (no real adapter yet).
+
+    The fan-out always produces exactly 5 agents so the eval harness shape
+    stays stable regardless of which keys are present.
+    """
+    agents: list[Agent] = []
+    for name in AgentName:
+        if name is AgentName.WEB_SEARCH and os.environ.get("TAVILY_API_KEY"):
+            agents.append(TavilyAgent(name=name))
+        elif name is AgentName.NEWS and os.environ.get("BRAVE_API_KEY"):
+            agents.append(BraveAgent(name=name, endpoint="news"))
+        elif name is AgentName.SCHOLAR and os.environ.get("EXA_API_KEY"):
+            agents.append(ExaAgent(name=name, category="research paper"))
+        else:
+            agents.append(MockAgent(name=name, latency_ms=latency_ms, failure_rate=failure_rate))
+    return agents

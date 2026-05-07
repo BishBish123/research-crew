@@ -1,0 +1,59 @@
+{
+  "_source": "https://exa.ai/docs/reference/search",
+  "_verified": "2026-05-06",
+  "_notes": "Top-level: requestId (required), results (required), searchType (optional), costDollars (optional). results[].score is optional. text/highlights only present when requested via contents param.",
+  "requestId": "req-exa-7f3a9b2c",
+  "searchType": "neural",
+  "results": [
+    {
+      "id": "https://arxiv.org/abs/1706.03762",
+      "url": "https://arxiv.org/abs/1706.03762",
+      "title": "Attention Is All You Need",
+      "publishedDate": "2017-06-12T00:00:00.000Z",
+      "author": "Ashish Vaswani et al.",
+      "score": 0.9451234,
+      "text": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks that include an encoder and a decoder. The best performing models also connect the encoder and decoder through an attention mechanism. We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely.",
+      "highlights": [
+        "We propose a new simple network architecture, the Transformer, based solely on attention mechanisms",
+        "dispensing with recurrence and convolutions entirely"
+      ],
+      "highlightScores": [0.9812, 0.9234],
+      "image": null,
+      "favicon": "https://arxiv.org/favicon.ico"
+    },
+    {
+      "id": "https://huggingface.co/docs/transformers/index",
+      "url": "https://huggingface.co/docs/transformers/index",
+      "title": "Transformers - Hugging Face Documentation",
+      "publishedDate": "2023-11-01T00:00:00.000Z",
+      "author": null,
+      "score": 0.8923456,
+      "text": "Transformers provides APIs and tools to easily download and train state-of-the-art pretrained models. Using pretrained models can reduce your compute costs, carbon footprint, and save you the time and resources required to train a model from scratch.",
+      "highlights": [
+        "Transformers provides APIs and tools to easily download and train state-of-the-art pretrained models"
+      ],
+      "highlightScores": [0.9012],
+      "image": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
+      "favicon": "https://huggingface.co/favicon.ico"
+    },
+    {
+      "id": "https://jalammar.github.io/illustrated-transformer/",
+      "url": "https://jalammar.github.io/illustrated-transformer/",
+      "title": "The Illustrated Transformer",
+      "publishedDate": "2018-06-27T00:00:00.000Z",
+      "author": "Jay Alammar",
+      "score": 0.8712345,
+      "text": "Discussions of AI, Machine Learning, NLP and other related topics. This post is a visual explanation of the Transformer — the model from the paper Attention is All You Need. It helps to understand the model as a black box first.",
+      "highlights": [
+        "This post is a visual explanation of the Transformer"
+      ],
+      "highlightScores": [0.8901],
+      "image": null,
+      "favicon": "https://jalammar.github.io/favicon.ico"
+    }
+  ],
+  "costDollars": {
+    "total": 0.005,
+    "search": 0.005
+  }
+}

@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
 
+import structlog
+
+from research_crew.dedup import make_semantic_dedup
+from research_crew.dedup.protocol import SemanticDedup
 from research_crew.models import (
     AgentName,
     AgentResult,
@@ -21,6 +25,8 @@ from research_crew.models import (
     ResearchReport,
     StepStatus,
 )
+
+_log = structlog.get_logger(__name__)
 
 
 class Synthesizer(Protocol):
@@ -36,9 +42,25 @@ class Synthesizer(Protocol):
 
 @dataclass(frozen=True)
 class StitchSynthesizer:
-    """Concatenate per-agent summaries, dedupe citations by URL, render markdown."""
+    """Concatenate per-agent summaries, dedupe citations by URL, render markdown.
+
+    Optionally performs cross-run semantic deduplication via the injected
+    *semantic_dedup* instance.  The default ``NullDedup`` keeps existing
+    behaviour unchanged — URL-only dedup is the only guard.
+
+    When a real :class:`~research_crew.dedup.pgvector.PgVectorSemanticDedup`
+    is injected (activated by ``RESEARCH_PG_DSN``), the synthesizer will:
+
+    1. Before adding a citation chunk to the report, call
+       :meth:`~research_crew.dedup.protocol.SemanticDedup.is_duplicate`.
+       If the chunk was seen in a prior run, log a debug line and skip it.
+    2. After successful synthesis, call
+       :meth:`~research_crew.dedup.protocol.SemanticDedup.add_seen` for
+       each citation snippet that made it into the final report.
+    """
 
     max_citations_per_agent: int = 5
+    semantic_dedup: SemanticDedup = field(default_factory=make_semantic_dedup)
 
     async def synthesize(
         self, run_id: str, question: str, agent_results: list[AgentResult]
@@ -76,7 +98,14 @@ class StitchSynthesizer:
             for r in failed:
                 sections.append(f"- **{r.agent.value}**: {r.error}")
 
-        merged_citations = list(_dedupe_citations(_iter_all_citations(agent_results)))
+        # URL dedup (existing behaviour).
+        url_deduped = list(_dedupe_citations(_iter_all_citations(agent_results)))
+
+        # Semantic dedup (new, no-op with NullDedup).
+        merged_citations = await _semantic_dedupe_citations(
+            url_deduped, run_id, self.semantic_dedup
+        )
+
         elapsed = (time.perf_counter() - t0) * 1000.0
         return ResearchReport(
             run_id=run_id,
@@ -86,6 +115,37 @@ class StitchSynthesizer:
             agent_results=agent_results,
             elapsed_ms=elapsed,
         )
+
+
+async def _semantic_dedupe_citations(
+    citations: list[Citation],
+    run_id: str,
+    dedup: SemanticDedup,
+) -> list[Citation]:
+    """Filter *citations* via semantic dedup, then record the survivors.
+
+    When *dedup* is a :class:`~research_crew.dedup.null.NullDedup` this
+    function returns *citations* unchanged in O(n) no-op calls.
+    """
+    kept: list[Citation] = []
+    for c in citations:
+        text = f"{c.title} {c.snippet}".strip() or c.url
+        is_dup, prior_run_id = await dedup.is_duplicate(text)
+        if is_dup:
+            _log.debug(
+                "synthesizer.semantic_dedup_skip",
+                url=c.url,
+                prior_run_id=prior_run_id,
+            )
+            continue
+        kept.append(c)
+
+    # Record survivors so future runs can compare against them.
+    for c in kept:
+        text = f"{c.title} {c.snippet}".strip() or c.url
+        await dedup.add_seen(text, run_id)
+
+    return kept
 
 
 def _iter_all_citations(results: list[AgentResult]) -> Iterable[Citation]:

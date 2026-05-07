@@ -50,6 +50,13 @@ _DEFAULT_SHADOW_MAX = 10_000
 _DEFAULT_RATE_LIMIT_PER_MIN = 10
 _RATE_LIMIT_WINDOW_S = 60.0
 
+# Hard ceiling on the number of distinct IPs the limiter tracks at any
+# one time. Without this, a sustained stream of unique source IPs (NAT
+# churn, scanners, DDoS) would grow the dict unboundedly even after
+# every per-IP window has aged out. On overflow we evict the oldest-
+# touched bucket — see ``_RateLimiter.check``.
+_DEFAULT_MAX_BUCKETS = 10_000
+
 # Heartbeat cadence and staleness threshold for orphan reconciliation.
 # The background task refreshes ``RunStatus.heartbeat_at`` every
 # ``_HEARTBEAT_INTERVAL_S`` seconds while the run is RUNNING. The
@@ -75,21 +82,42 @@ class _RateLimiter:
     rejected with a Retry-After hint computed from the oldest pending
     timestamp.
 
+    Memory hygiene: ``_buckets`` is an ``OrderedDict`` keyed by IP. We
+    rely on insertion-order semantics so the oldest-touched bucket can
+    be evicted in O(1) when ``len > max_buckets``. After expired
+    timestamps drain a bucket to empty, we delete the bucket entirely
+    so a flood of distinct one-shot IPs cannot leak memory across
+    windows. ``move_to_end`` is called on every access so "oldest" is
+    measured by last-touched time, not insertion time.
+
     Concurrency note: all reads/writes happen on the FastAPI event loop,
     so dict/deque mutations are not interleaved at the bytecode level.
     No explicit lock is needed.
     """
 
-    def __init__(self, limit_per_min: int, window_s: float = _RATE_LIMIT_WINDOW_S) -> None:
+    def __init__(
+        self,
+        limit_per_min: int,
+        window_s: float = _RATE_LIMIT_WINDOW_S,
+        max_buckets: int = _DEFAULT_MAX_BUCKETS,
+    ) -> None:
         if limit_per_min <= 0:
             raise ValueError("limit_per_min must be positive")
+        if max_buckets <= 0:
+            raise ValueError("max_buckets must be positive")
         self._limit = limit_per_min
         self._window = window_s
-        self._buckets: dict[str, deque[float]] = {}
+        self._max_buckets = max_buckets
+        self._buckets: OrderedDict[str, deque[float]] = OrderedDict()
 
     @property
     def limit(self) -> int:
         return self._limit
+
+    @property
+    def bucket_count(self) -> int:
+        """Test-visible size accessor (no public surface area otherwise)."""
+        return len(self._buckets)
 
     def check(self, ip: str, *, now: float | None = None) -> tuple[bool, float]:
         """Record a request for `ip`. Returns ``(allowed, retry_after_s)``.
@@ -97,21 +125,60 @@ class _RateLimiter:
         On allow, ``retry_after_s`` is 0. On reject, it's the number of
         seconds the caller would need to wait before the oldest in-window
         timestamp ages out.
+
+        Side effect: empty buckets are pruned, and on insert beyond
+        ``max_buckets`` the oldest-touched bucket is evicted.
         """
         ts = time.monotonic() if now is None else now
         cutoff = ts - self._window
         bucket = self._buckets.get(ip)
         if bucket is None:
             bucket = deque()
+            # Enforce the bucket-count ceiling *before* inserting so a
+            # sustained unique-IP flood can't temporarily blow the cap.
+            while len(self._buckets) >= self._max_buckets:
+                self._buckets.popitem(last=False)
             self._buckets[ip] = bucket
+        else:
+            # Touching an existing bucket bumps it to the youngest
+            # position so eviction targets truly idle entries.
+            self._buckets.move_to_end(ip)
         # Drop expired entries off the front before counting.
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
+        if not bucket:
+            # Window fully aged out; the bucket itself can go too. The
+            # caller's request will re-create it below if it's allowed.
+            del self._buckets[ip]
+            bucket = deque()
+            while len(self._buckets) >= self._max_buckets:
+                self._buckets.popitem(last=False)
+            self._buckets[ip] = bucket
         if len(bucket) >= self._limit:
             retry_after = max(0.0, bucket[0] + self._window - ts)
             return False, retry_after
         bucket.append(ts)
         return True, 0.0
+
+    def gc(self, *, now: float | None = None) -> int:
+        """Drop empty / fully-aged-out buckets. Returns number evicted.
+
+        Only the limiter's own ``check`` calls trigger inline pruning;
+        a bucket whose owning IP never returns to the service stays
+        non-empty until its window ages out — but it can also be
+        proactively GC'd by tests or a future periodic task.
+        """
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - self._window
+        evicted = 0
+        for ip in list(self._buckets):
+            bucket = self._buckets[ip]
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if not bucket:
+                del self._buckets[ip]
+                evicted += 1
+        return evicted
 
     def reset(self) -> None:
         """Test-only hook: drop all buckets."""

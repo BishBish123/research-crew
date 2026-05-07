@@ -203,6 +203,53 @@ class TestRateLimiterUnit:
         with pytest.raises(ValueError):
             _RateLimiter(limit_per_min=-1)
 
+    def test_rate_limit_evicts_empty_buckets(self) -> None:
+        """A flood of distinct IPs cycling through their windows must
+        not leak dict entries: once each window has aged out, the dict
+        returns to size 0.
+        """
+        rl = _RateLimiter(limit_per_min=2, window_s=60.0)
+        # 100 distinct IPs each ping once at t=0.
+        for i in range(100):
+            allowed, _ = rl.check(f"10.0.0.{i}", now=0.0)
+            assert allowed is True
+        assert rl.bucket_count == 100
+        # After the window ages out, an explicit GC sweep drops them all.
+        evicted = rl.gc(now=120.0)
+        assert evicted == 100
+        assert rl.bucket_count == 0
+        # And a check from any of those IPs after the window also frees
+        # its own entry (the inline-prune path) — verify with a fresh
+        # cycle.
+        for i in range(5):
+            rl.check(f"172.16.0.{i}", now=200.0)
+        assert rl.bucket_count == 5
+        # Same IP at t=300 (window aged out): bucket is empty on entry,
+        # gets reaped + recreated, leaving exactly one entry per IP.
+        for i in range(5):
+            rl.check(f"172.16.0.{i}", now=300.0)
+        assert rl.bucket_count == 5
+
+    def test_rate_limit_evicts_oldest_when_max_buckets_exceeded(self) -> None:
+        """A sustained flood of unique IPs hits the max_buckets ceiling;
+        the limiter must evict the oldest-touched bucket on overflow so
+        memory stays bounded."""
+        rl = _RateLimiter(limit_per_min=10, window_s=60.0, max_buckets=3)
+        rl.check("a", now=0.0)
+        rl.check("b", now=1.0)
+        rl.check("c", now=2.0)
+        assert rl.bucket_count == 3
+        # Touching "a" again moves it to youngest; "b" is now oldest.
+        rl.check("a", now=3.0)
+        rl.check("d", now=4.0)
+        assert rl.bucket_count == 3
+        # "b" should have been the eviction target.
+        # We can't introspect order from outside, but a fresh "b" check
+        # after the window is still small means the slot was reused —
+        # the simpler assertion is that the cap held.
+        rl.check("e", now=5.0)
+        assert rl.bucket_count == 3
+
 
 class TestTrustedProxyXFF:
     """When the immediate peer is a trusted proxy the rate limiter

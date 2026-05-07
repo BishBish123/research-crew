@@ -3,8 +3,10 @@
 Background execution is bound to the accepting instance — a process
 restart after `put_run(RUNNING)` strands the run with no worker.
 The lifespan does a one-shot SCAN over `{prefix}:run:*` and flips
-any RUNNING entries to FAILED with a clear "abandoned" message so
-polling clients receive a terminal answer instead of looping forever.
+any RUNNING entries whose heartbeat has gone stale to FAILED. Runs
+whose heartbeat is fresh are left alone so a peer instance running
+concurrently can finish its in-flight work; only true orphans (no
+heartbeat for >`RESEARCH_HEARTBEAT_STALE_S` seconds) are reconciled.
 
 A durable worker queue is the right long-term fix; this is the
 smallest defensible interim. See README "Limitations".
@@ -14,12 +16,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 import fakeredis.aioredis as fake_aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from research_crew.api import _execute_run, _reconcile_orphan_runs, _TerminalShadow, app
+from research_crew.api import (
+    _execute_run,
+    _heartbeat_loop,
+    _reconcile_orphan_runs,
+    _TerminalShadow,
+    app,
+)
 from research_crew.models import ResearchRequest, RunStatus, StepStatus
 from research_crew.store import RedisRunStore
 
@@ -93,6 +102,122 @@ class TestReconcileOrphanRuns:
         app.state.store = store
         # Just must not raise.
         await _reconcile_orphan_runs(app)
+        await fake.aclose()
+
+    async def test_lifespan_does_not_reconcile_recent_heartbeat(self) -> None:
+        """A peer instance's RUNNING run with a fresh heartbeat must
+        survive startup unchanged — flipping it would kill live work."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        # Plant a RUNNING run owned by a different worker, heartbeating
+        # right now. This represents a peer instance mid-run.
+        live = RunStatus(
+            run_id="live-peer",
+            question="what is python",
+            state=StepStatus.RUNNING,
+            owner_id="peer-worker-id",
+            heartbeat_at=datetime.now(UTC),
+        )
+        await store.put_run(live)
+        app.state.redis = fake
+        app.state.store = store
+
+        await _reconcile_orphan_runs(app)
+
+        unchanged = await store.get_run("live-peer")
+        assert unchanged is not None
+        assert unchanged.state is StepStatus.RUNNING
+        assert unchanged.error is None
+        assert unchanged.owner_id == "peer-worker-id"
+        await fake.aclose()
+
+    async def test_lifespan_reconciles_stale_heartbeat(self) -> None:
+        """A RUNNING run whose heartbeat has gone stale (older than the
+        configured threshold) gets flipped to FAILED with a reason that
+        names the staleness."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        # Heartbeat 10 minutes ago — well past the 120s default.
+        stale_ts = datetime.now(UTC) - timedelta(minutes=10)
+        stale = RunStatus(
+            run_id="stale-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+            owner_id="dead-worker",
+            heartbeat_at=stale_ts,
+        )
+        await store.put_run(stale)
+        app.state.redis = fake
+        app.state.store = store
+
+        await _reconcile_orphan_runs(app)
+
+        recovered = await store.get_run("stale-1")
+        assert recovered is not None
+        assert recovered.state is StepStatus.FAILED
+        assert recovered.error is not None
+        assert "abandoned" in recovered.error
+        assert "no heartbeat" in recovered.error
+        await fake.aclose()
+
+
+class TestHeartbeatLoop:
+    """The heartbeat loop refreshes `RunStatus.heartbeat_at` while a run
+    is RUNNING so peer instances' lifespan reconcilers can tell live
+    work from a true orphan."""
+
+    async def test_heartbeat_updates_during_run(self) -> None:
+        """A loop tick must persist a newer `heartbeat_at` to the store."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        original_ts = datetime.now(UTC) - timedelta(minutes=5)
+        running = RunStatus(
+            run_id="hb-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+            owner_id="me",
+            heartbeat_at=original_ts,
+        )
+        await store.put_run(running)
+
+        # Tiny interval so the test doesn't sleep for 30s.
+        task = asyncio.create_task(_heartbeat_loop(store, "hb-1", interval_s=0.01))
+        # Let at least one tick land.
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        refreshed = await store.get_run("hb-1")
+        assert refreshed is not None
+        assert refreshed.state is StepStatus.RUNNING
+        assert refreshed.heartbeat_at is not None
+        assert refreshed.heartbeat_at > original_ts
+        await fake.aclose()
+
+    async def test_heartbeat_stops_after_terminal_state(self) -> None:
+        """If the run record reaches a terminal state, the loop returns
+        instead of overwriting the terminal blob with a heartbeat-only
+        update."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        terminal = RunStatus(
+            run_id="hb-done",
+            question="what is python",
+            state=StepStatus.SUCCEEDED,
+            heartbeat_at=datetime.now(UTC),
+        )
+        await store.put_run(terminal)
+
+        # Run the loop with a tiny interval; it must observe SUCCEEDED
+        # and return cleanly without raising.
+        await asyncio.wait_for(
+            _heartbeat_loop(store, "hb-done", interval_s=0.01), timeout=0.5
+        )
+
+        unchanged = await store.get_run("hb-done")
+        assert unchanged is not None
+        assert unchanged.state is StepStatus.SUCCEEDED
         await fake.aclose()
 
 

@@ -177,3 +177,12 @@ class RunStatus(BaseModel):
     # have a `report` (e.g. orphans reconciled by a fresh process after
     # an unclean restart of the previous one).
     error: str | None = None
+    # Identifier for the worker process that owns the run. Stamped at
+    # POST /research time, used by the lifespan reconciler so a fresh
+    # process never tramples a peer instance's still-live RUNNING work.
+    owner_id: str | None = None
+    # Wall-clock timestamp of the most recent heartbeat from the
+    # background task. Updated every ~30s while a run is RUNNING; the
+    # reconciler only flips runs whose heartbeat is older than the
+    # configured stale threshold. None on legacy / pre-heartbeat blobs.
+    heartbeat_at: datetime | None = None

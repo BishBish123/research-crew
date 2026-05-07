@@ -50,6 +50,22 @@ _DEFAULT_SHADOW_MAX = 10_000
 _DEFAULT_RATE_LIMIT_PER_MIN = 10
 _RATE_LIMIT_WINDOW_S = 60.0
 
+# Heartbeat cadence and staleness threshold for orphan reconciliation.
+# The background task refreshes ``RunStatus.heartbeat_at`` every
+# ``_HEARTBEAT_INTERVAL_S`` seconds while the run is RUNNING. The
+# lifespan reconciler only flips a RUNNING blob to FAILED if its
+# heartbeat is older than ``_DEFAULT_STALE_HEARTBEAT_S``; this prevents
+# a freshly-started instance from killing peer instances' still-live
+# work in a multi-process deployment. Operators can override via
+# ``RESEARCH_HEARTBEAT_STALE_S``.
+_HEARTBEAT_INTERVAL_S = 30.0
+_DEFAULT_STALE_HEARTBEAT_S = 120
+
+# Process-wide identifier stamped on every RUNNING run claimed by this
+# worker. A peer instance reading a foreign ``owner_id`` knows the run
+# is not its own to reconcile until the heartbeat goes stale.
+_WORKER_ID = uuid.uuid4().hex
+
 
 class _RateLimiter:
     """Per-IP sliding-window counter for POST /research.
@@ -243,14 +259,21 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
 
 
 async def _reconcile_orphan_runs(app_: FastAPI) -> None:
-    """Mark any RUNNING run records FAILED on startup.
+    """Mark abandoned RUNNING run records FAILED on startup.
 
     Background execution is in-process, so a previous process that
     crashed or was killed mid-run leaves RUNNING records in Redis with
-    no worker behind them. Sweep the keyspace once at startup and flip
-    each one to FAILED with a clear "abandoned by previous process"
-    error so polling clients get a terminal answer instead of looping
-    forever.
+    no worker behind them. The reconciler distinguishes "abandoned"
+    from "still being executed by a peer instance" via the run's
+    ``heartbeat_at`` field: only runs whose heartbeat is older than
+    ``_stale_heartbeat_seconds()`` (default 120s, env-overridable) are
+    flipped. Active peers refresh the heartbeat every
+    ``_HEARTBEAT_INTERVAL_S`` seconds, so they will never look stale to
+    a sibling lifespan running concurrently.
+
+    Legacy blobs without ``heartbeat_at`` (older deploys, or runs
+    written before the heartbeat field landed) are also flipped, since
+    we have no other signal to tell live work from a true orphan.
 
     This is best-effort: we swallow any scan/parse error so a transient
     Redis hiccup at startup doesn't block the service from coming up.
@@ -263,40 +286,126 @@ async def _reconcile_orphan_runs(app_: FastAPI) -> None:
     if redis_client is None or not isinstance(store, RedisRunStore):
         return
     pattern = f"{store.prefix}:run:*"
+    stale_after_s = _stale_heartbeat_seconds()
+    now = datetime.now(UTC)
     reconciled = 0
+    skipped_live = 0
     try:
         # SCAN to avoid blocking the loop on a large keyspace; the same
         # shape /health uses so the cost profile is already understood.
         async for key in redis_client.scan_iter(match=pattern, count=200):
             if key.endswith(":steps"):
                 continue
-            try:
-                raw = await redis_client.get(key)
-            except Exception as exc:  # transient — log and skip this key
-                _log.warning("api.reconcile_get_failed", key=key, error=str(exc))
-                continue
-            if raw is None or '"state":"running"' not in raw:
-                continue
-            try:
-                run = RunStatus.model_validate_json(raw)
-            except Exception as exc:
-                _log.warning("api.reconcile_parse_failed", key=key, error=str(exc))
-                continue
-            if run.state is not StepStatus.RUNNING:
-                continue
-            run.state = StepStatus.FAILED
-            run.finished_at = datetime.now(UTC)
-            run.error = "abandoned by previous process"
-            try:
-                await store.put_run(run)
+            outcome = await _reconcile_one(
+                redis_client, store, key, now=now, stale_after_s=stale_after_s
+            )
+            if outcome == "reconciled":
                 reconciled += 1
-            except Exception as exc:
-                _log.warning("api.reconcile_put_failed", run_id=run.run_id, error=str(exc))
+            elif outcome == "skipped_live":
+                skipped_live += 1
     except Exception as exc:
         _log.warning("api.reconcile_scan_failed", error=str(exc))
         return
-    if reconciled:
-        _log.warning("api.reconciled_orphan_runs", count=reconciled)
+    if reconciled or skipped_live:
+        _log.warning(
+            "api.reconciled_orphan_runs",
+            reconciled=reconciled,
+            skipped_live=skipped_live,
+        )
+
+
+async def _reconcile_one(
+    redis_client: aioredis.Redis,
+    store: RedisRunStore,
+    key: str,
+    *,
+    now: datetime,
+    stale_after_s: int,
+) -> str:
+    """Process a single ``{prefix}:run:*`` key for the lifespan reconciler.
+
+    Returns ``"reconciled"`` on flip, ``"skipped_live"`` if a fresh
+    heartbeat kept the run alive, ``"noop"`` for everything else
+    (terminal, parse error, transient outage). Caller logs the rollup.
+    """
+    run = await _load_running_run(redis_client, key)
+    if run is None:
+        return "noop"
+    abandon_reason = _abandonment_reason(run, now=now, stale_after_s=stale_after_s)
+    if abandon_reason is None:
+        return "skipped_live"
+    run.state = StepStatus.FAILED
+    run.finished_at = now
+    run.error = abandon_reason
+    try:
+        await store.put_run(run)
+    except Exception as exc:
+        _log.warning("api.reconcile_put_failed", run_id=run.run_id, error=str(exc))
+        return "noop"
+    return "reconciled"
+
+
+async def _load_running_run(
+    redis_client: aioredis.Redis, key: str
+) -> RunStatus | None:
+    """Read + parse a RUNNING blob; return ``None`` for any reason it
+    isn't a candidate (transient read error, missing, terminal,
+    unparseable, or state not actually RUNNING)."""
+    try:
+        raw = await redis_client.get(key)
+    except Exception as exc:  # transient — log and skip this key
+        _log.warning("api.reconcile_get_failed", key=key, error=str(exc))
+        return None
+    if raw is None or '"state":"running"' not in raw:
+        return None
+    try:
+        run = RunStatus.model_validate_json(raw)
+    except Exception as exc:
+        _log.warning("api.reconcile_parse_failed", key=key, error=str(exc))
+        return None
+    return run if run.state is StepStatus.RUNNING else None
+
+
+def _abandonment_reason(
+    run: RunStatus, *, now: datetime, stale_after_s: int
+) -> str | None:
+    """Decide whether a RUNNING run should be flipped to FAILED.
+
+    Returns the human-readable abandonment reason, or ``None`` if the
+    run is still live (fresh heartbeat) and must not be touched.
+    """
+    if run.heartbeat_at is None:
+        # Legacy / pre-heartbeat blobs: no signal to tell live work
+        # from a true orphan, so treat as abandoned.
+        return "abandoned by previous process"
+    age_s = (now - run.heartbeat_at).total_seconds()
+    if age_s < stale_after_s:
+        _log.info(
+            "api.reconcile_skipped_live",
+            run_id=run.run_id,
+            owner_id=run.owner_id,
+            heartbeat_age_s=age_s,
+            stale_after_s=stale_after_s,
+        )
+        return None
+    return f"abandoned: no heartbeat for {int(age_s)}s (threshold {stale_after_s}s)"
+
+
+def _stale_heartbeat_seconds() -> int:
+    """Resolve the heartbeat staleness threshold from the environment.
+
+    Falls back to ``_DEFAULT_STALE_HEARTBEAT_S`` on missing / unparseable
+    / non-positive values so an operator typo can't silently disable
+    reconciliation.
+    """
+    raw = os.environ.get("RESEARCH_HEARTBEAT_STALE_S")
+    if not raw:
+        return _DEFAULT_STALE_HEARTBEAT_S
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return _DEFAULT_STALE_HEARTBEAT_S
+    return parsed if parsed > 0 else _DEFAULT_STALE_HEARTBEAT_S
 
 
 app = FastAPI(title="research-crew", version="0.1.0", lifespan=_lifespan)
@@ -490,7 +599,16 @@ async def submit_research(
     _enforce_rate_limit(request)
     run_id = uuid.uuid4().hex
     store = _store(request)
-    run = RunStatus(run_id=run_id, question=payload.question, state=StepStatus.RUNNING)
+    # Stamp ownership + an initial heartbeat so the lifespan reconciler
+    # of any peer instance treats this run as live until our heartbeat
+    # actually goes stale.
+    run = RunStatus(
+        run_id=run_id,
+        question=payload.question,
+        state=StepStatus.RUNNING,
+        owner_id=_WORKER_ID,
+        heartbeat_at=datetime.now(UTC),
+    )
     try:
         await store.put_run(run)
     except (StoreUnavailableError, RedisError) as exc:
@@ -634,6 +752,118 @@ async def _persist_terminal(
         shadow[run.run_id] = run
 
 
+async def _stop_task(task: asyncio.Task[None]) -> None:
+    """Cancel a sibling task and await it, swallowing the propagated
+    ``CancelledError`` (and any non-cancellation exit) so the caller
+    can proceed with its terminal write without re-entering the
+    cancellation handler."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+async def _heartbeat_loop(
+    store: RunStore, run_id: str, *, interval_s: float = _HEARTBEAT_INTERVAL_S
+) -> None:
+    """Refresh ``RunStatus.heartbeat_at`` on a fixed cadence.
+
+    The loop is meant to be spawned as an `asyncio.Task` alongside the
+    workflow body and cancelled once the workflow returns. It tolerates
+    transient store outages (RedisError / StoreUnavailableError) by
+    logging + continuing — the next tick will retry. Any other
+    exception propagates so the bug surfaces in the logs.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            existing = await store.get_run(run_id)
+            if existing is None or existing.state is not StepStatus.RUNNING:
+                # Terminal write already landed (or the run record was
+                # evicted). Either way, no further heartbeats apply.
+                return
+            existing.heartbeat_at = datetime.now(UTC)
+            await store.put_run(existing)
+        except asyncio.CancelledError:
+            raise
+        except (StoreUnavailableError, RedisError) as exc:
+            # Heartbeat best-effort: a brief Redis hiccup must not kill
+            # the run. The next iteration will retry.
+            _log.warning(
+                "api.heartbeat_store_outage",
+                run_id=run_id,
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+
+async def _run_workflow_and_persist(
+    store: RunStore,
+    shadow: _TerminalShadow,
+    run_id: str,
+    payload: ResearchRequest,
+    run_started_at: float,
+    heartbeat_task: asyncio.Task[None],
+) -> tuple[int, int, int]:
+    """Happy-path body of `_execute_run`. Extracted so the outer function
+    stays under the per-function statement budget while keeping the
+    cancellation/exception branches inline where they're easiest to
+    read.
+
+    Returns ``(agent_count, succeeded_agents, failed_agents)`` so the
+    caller can pass through accurate counters to the
+    ``api.run_completed`` event from the cancellation/exception paths
+    if work was already partially done.
+    """
+    agents = default_agents()
+    if payload.agents:
+        wanted = set(payload.agents)
+        agents = [a for a in agents if a.name in wanted]
+    agent_count = len(agents)
+    engine = WorkflowEngine(
+        run_id=run_id,
+        record_step=store.append_step,
+        cache_get=store.cache_get,
+        cache_put=store.cache_put,
+    )
+    results = await engine.run_parallel(agents, payload.question)
+    succeeded_agents = sum(1 for r in results if r.status is not StepStatus.FAILED)
+    failed_agents = sum(1 for r in results if r.status is StepStatus.FAILED)
+    report: ResearchReport = await StitchSynthesizer().synthesize(
+        run_id, payload.question, results
+    )
+    await _stop_task(heartbeat_task)
+    finished = await store.get_run(run_id)
+    if finished is None:
+        _emit_run_completed(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            terminal_state=StepStatus.FAILED,
+            agent_count=agent_count,
+            succeeded_agents=succeeded_agents,
+            failed_agents=failed_agents,
+            note="run_record_missing_at_finalization",
+        )
+        return agent_count, succeeded_agents, failed_agents
+    finished.state = (
+        StepStatus.FAILED
+        if all(r.status is StepStatus.FAILED for r in results)
+        else StepStatus.SUCCEEDED
+    )
+    finished.finished_at = datetime.now(UTC)
+    finished.report = report
+    finished.total_latency_ms = (time.monotonic() - run_started_at) * 1000.0
+    await _persist_terminal(store, shadow, finished, agent_label="workflow_done")
+    _emit_run_completed(
+        run_id=run_id,
+        run_started_at=run_started_at,
+        terminal_state=finished.state,
+        agent_count=agent_count,
+        succeeded_agents=succeeded_agents,
+        failed_agents=failed_agents,
+    )
+    return agent_count, succeeded_agents, failed_agents
+
+
 async def _execute_run(
     store: RunStore,
     shadow: _TerminalShadow,
@@ -650,6 +880,11 @@ async def _execute_run(
     still report a terminal state — the next-best thing to a durable
     write.
 
+    A sibling heartbeat task runs in the background while the workflow
+    executes; it bumps ``RunStatus.heartbeat_at`` every
+    ``_HEARTBEAT_INTERVAL_S`` so a peer instance's lifespan reconciler
+    can tell live work from a true orphan.
+
     On every terminal write we also emit `api.run_completed` with the
     end-to-end latency, agent counts, and terminal state so operators
     have a single log line to grep for run-level SLO tracking.
@@ -658,52 +893,10 @@ async def _execute_run(
     succeeded_agents = 0
     failed_agents = 0
     agent_count = 0
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(store, run_id))
     try:
-        agents = default_agents()
-        if payload.agents:
-            wanted = set(payload.agents)
-            agents = [a for a in agents if a.name in wanted]
-        agent_count = len(agents)
-        engine = WorkflowEngine(
-            run_id=run_id,
-            record_step=store.append_step,
-            cache_get=store.cache_get,
-            cache_put=store.cache_put,
-        )
-        results = await engine.run_parallel(agents, payload.question)
-        succeeded_agents = sum(1 for r in results if r.status is not StepStatus.FAILED)
-        failed_agents = sum(1 for r in results if r.status is StepStatus.FAILED)
-        report: ResearchReport = await StitchSynthesizer().synthesize(
-            run_id, payload.question, results
-        )
-        finished = await store.get_run(run_id)
-        if finished is None:
-            _emit_run_completed(
-                run_id=run_id,
-                run_started_at=run_started_at,
-                terminal_state=StepStatus.FAILED,
-                agent_count=agent_count,
-                succeeded_agents=succeeded_agents,
-                failed_agents=failed_agents,
-                note="run_record_missing_at_finalization",
-            )
-            return
-        finished.state = (
-            StepStatus.FAILED
-            if all(r.status is StepStatus.FAILED for r in results)
-            else StepStatus.SUCCEEDED
-        )
-        finished.finished_at = datetime.now(UTC)
-        finished.report = report
-        finished.total_latency_ms = (time.monotonic() - run_started_at) * 1000.0
-        await _persist_terminal(store, shadow, finished, agent_label="workflow_done")
-        _emit_run_completed(
-            run_id=run_id,
-            run_started_at=run_started_at,
-            terminal_state=finished.state,
-            agent_count=agent_count,
-            succeeded_agents=succeeded_agents,
-            failed_agents=failed_agents,
+        agent_count, succeeded_agents, failed_agents = await _run_workflow_and_persist(
+            store, shadow, run_id, payload, run_started_at, heartbeat_task
         )
     except asyncio.CancelledError:
         # Shutdown-time cancellation must still leave a terminal record
@@ -712,6 +905,7 @@ async def _execute_run(
         # FAILED RunStatus with a clear reason, then let the cancellation
         # propagate so the surrounding task tree unwinds cleanly.
         _log.warning("api.background_run_cancelled", run_id=run_id)
+        await _stop_task(heartbeat_task)
         cancelled = RunStatus(
             run_id=run_id,
             question=payload.question,
@@ -738,6 +932,7 @@ async def _execute_run(
             exc_type=type(exc).__name__,
             error=str(exc),
         )
+        await _stop_task(heartbeat_task)
         # Best-effort: mark the run FAILED so callers see a terminal state.
         # If the store itself is the cause of the outage, both the read
         # and the write may raise — fall back to the in-process shadow
@@ -774,6 +969,11 @@ async def _execute_run(
             failed_agents=max(failed_agents, agent_count - succeeded_agents),
             note="exception_path",
         )
+    finally:
+        # Belt-and-braces: every successful path already cancelled the
+        # heartbeat above, but if a new exception path is added later
+        # this guarantees the task never outlives the workflow.
+        await _stop_task(heartbeat_task)
 
 
 def _emit_run_completed(

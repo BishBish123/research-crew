@@ -292,6 +292,91 @@ class TestTrustedProxyXFF:
         finally:
             app.state.trusted_proxies = set()
 
+    async def test_xff_canonicalizes_ipv6_brackets_and_ports(
+        self, open_client: AsyncClient
+    ) -> None:
+        """Equivalent encodings of the same client IP share a bucket.
+
+        Without canonicalisation a client could dodge the per-IP cap by
+        rotating its source port or by toggling between bracketed and
+        bare IPv6 forms — each variant would land in its own deque and
+        the rate limit would never trip.
+        """
+        app.state.rate_limiter = _RateLimiter(limit_per_min=1)
+        app.state.trusted_proxies = {"127.0.0.1"}
+        try:
+            # First request from `[::1]:8080` — bracketed IPv6 + port.
+            r1 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "[::1]:8080"},
+            )
+            assert r1.status_code == 202
+            # Same client (`::1`) re-encoded as `[::1]:9999` — different
+            # port, different bracket presence — must hit the same
+            # bucket and 429.
+            r2 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "[::1]:9999"},
+            )
+            assert r2.status_code == 429
+            # And a bare `::1` encoding must also share that bucket.
+            r3 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "::1"},
+            )
+            assert r3.status_code == 429
+            # IPv4 with port also normalises: `10.0.0.5:12345` and
+            # `10.0.0.5` share a bucket.
+            app.state.rate_limiter = _RateLimiter(limit_per_min=1)
+            r4 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.5:12345"},
+            )
+            assert r4.status_code == 202
+            r5 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.5"},
+            )
+            assert r5.status_code == 429
+        finally:
+            app.state.trusted_proxies = set()
+
+    async def test_xff_skips_unparseable_tokens(self, open_client: AsyncClient) -> None:
+        """A token that doesn't parse as an IP is skipped, not used as
+        a bucket key — otherwise garbage in the header would create a
+        per-string bucket and leak memory."""
+        app.state.rate_limiter = _RateLimiter(limit_per_min=2)
+        app.state.trusted_proxies = {"127.0.0.1"}
+        try:
+            # First token is garbage, second is a real IP — limiter
+            # must use the real one.
+            r1 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "not-an-ip, 10.0.0.99"},
+            )
+            assert r1.status_code == 202
+            r2 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "another-bad, 10.0.0.99"},
+            )
+            assert r2.status_code == 202
+            # Third request from same real IP hits the cap.
+            r3 = await open_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"X-Forwarded-For": "10.0.0.99"},
+            )
+            assert r3.status_code == 429
+        finally:
+            app.state.trusted_proxies = set()
+
     async def test_rate_limit_ignores_xff_when_proxy_not_trusted(
         self, open_client: AsyncClient
     ) -> None:

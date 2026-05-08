@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import os
 import secrets
@@ -528,6 +529,13 @@ def _client_ip(request: Request) -> str:
     deployments behind ALB/nginx/Cloudflare see the originating
     client IP.
 
+    Each XFF hop is canonicalised through ``_canonical_ip`` before
+    bucket lookup so equivalent representations of the same client
+    (``10.0.0.1`` vs ``10.0.0.1:12345``, ``::1`` vs ``[::1]:8080``)
+    share a bucket instead of fanning into N independent ones — the
+    latter would let an attacker dodge the per-IP cap by rotating the
+    port suffix.
+
     The ASGI transport used in tests doesn't always populate
     ``request.client``; fall back to a sentinel so the test path still
     exercises the limiter (one bucket for everyone) rather than
@@ -543,12 +551,54 @@ def _client_ip(request: Request) -> str:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
             for raw in forwarded.split(","):
-                candidate = raw.strip()
-                if candidate and candidate not in trusted:
-                    return candidate
+                candidate = _canonical_ip(raw)
+                if candidate is None or candidate in trusted:
+                    continue
+                return candidate
     if peer:
         return peer
     return "unknown"
+
+
+def _canonical_ip(raw: str) -> str | None:
+    """Normalise an XFF hop to a canonical IP string, or ``None``.
+
+    Real-world XFF emitters mix several encodings for the same client:
+
+    * ``"10.0.0.1"`` — bare IPv4
+    * ``"10.0.0.1:12345"`` — IPv4 + ephemeral port (some Envoy configs)
+    * ``"::1"`` — bare IPv6
+    * ``"[::1]:8080"`` — IPv6 + port (RFC 3986 bracketed form)
+    * ``"  10.0.0.1  "`` — surrounding whitespace from CSV split
+
+    Without canonicalisation each variant lands in its own
+    ``_RateLimiter`` bucket, which is both a memory leak and a
+    correctness bug — a client cycling its source port could dodge
+    the per-IP cap. We strip brackets / ports, validate via the
+    stdlib ``ipaddress`` module, and return the IPv4/IPv6 string in
+    its compressed canonical form. Unparseable tokens return ``None``
+    so the caller can skip them rather than treat an empty / garbage
+    string as a real client identity.
+    """
+    token = raw.strip()
+    if not token:
+        return None
+    # Bracketed IPv6 with optional port: `[::1]` or `[::1]:8080`.
+    if token.startswith("["):
+        end = token.find("]")
+        if end == -1:
+            return None
+        host = token[1:end]
+    elif token.count(":") == 1:
+        # Single colon → almost certainly IPv4:port (bare IPv6 like
+        # `::1` always has multiple colons or a leading bracket).
+        host, _, _port = token.partition(":")
+    else:
+        host = token
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        return None
 
 
 def _enforce_rate_limit(request: Request) -> None:

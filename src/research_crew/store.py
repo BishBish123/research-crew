@@ -12,6 +12,14 @@ The prefix is read from ``RESEARCH_REDIS_PREFIX`` at API lifespan; tests
 construct ``RedisRunStore`` with an explicit prefix to assert the raw
 keys land where expected. See ADR-001 for the full rationale.
 
+Schema versioning: persisted ``RunStatus`` / ``StepRecord`` blobs carry
+a ``schema_version`` field. Readers consult
+``research_crew.models.CURRENT_SCHEMA_VERSION``: blobs whose declared
+version exceeds the reader's are logged and skipped (a newer deploy
+running ahead of this one shouldn't crash older readers); blobs whose
+version is older are migrated by ``migrate_run_blob`` /
+``_migrate_step_blob`` before validation.
+
 Designed to drop in next to a real Inngest deployment: the run / step
 keys mirror what a workflow engine would write, so a future commit can
 replace this with `inngest.step.run(...)` without touching the API.
@@ -20,17 +28,21 @@ replace this with `inngest.step.run(...)` without touching the API.
 from __future__ import annotations
 
 import json
-from typing import Protocol
+from typing import Any, Protocol
 
 import redis.asyncio as aioredis
+import structlog
 
 from research_crew.models import (
+    CURRENT_SCHEMA_VERSION,
     AgentResult,
     ResearchReport,
     RunStatus,
     StepRecord,
     StepStatus,
 )
+
+_log = structlog.get_logger(__name__)
 
 DEFAULT_REDIS_PREFIX = "research"
 
@@ -91,7 +103,10 @@ class RedisRunStore:
         raw = await self._r.get(self._run_key(run_id))
         if raw is None:
             return None
-        return RunStatus.model_validate(json.loads(raw))
+        payload = migrate_run_blob(json.loads(raw), key=self._run_key(run_id))
+        if payload is None:
+            return None
+        return RunStatus.model_validate(payload)
 
     async def put_run(self, run: RunStatus) -> None:
         await self._r.set(self._run_key(run.run_id), run.model_dump_json(), ex=self._ttl * 24)
@@ -103,7 +118,13 @@ class RedisRunStore:
 
     async def list_steps(self, run_id: str) -> list[StepRecord]:
         raws = await self._r.lrange(self._steps_key(run_id), 0, -1)  # type: ignore[misc]
-        return [StepRecord.model_validate(json.loads(r)) for r in raws]
+        steps: list[StepRecord] = []
+        for r in raws:
+            payload = _migrate_step_blob(json.loads(r), key=self._steps_key(run_id))
+            if payload is None:
+                continue
+            steps.append(StepRecord.model_validate(payload))
+        return steps
 
     async def cache_get(self, dedup_key: str) -> AgentResult | None:
         raw = await self._r.get(self._step_cache_key(dedup_key))
@@ -113,6 +134,51 @@ class RedisRunStore:
 
     async def cache_put(self, dedup_key: str, result: AgentResult) -> None:
         await self._r.set(self._step_cache_key(dedup_key), result.model_dump_json(), ex=self._ttl)
+
+
+def migrate_run_blob(payload: dict[str, Any], *, key: str) -> dict[str, Any] | None:
+    """Bring a persisted RunStatus dict up to ``CURRENT_SCHEMA_VERSION``.
+
+    * Missing / older ``schema_version`` is treated as v1 and the field
+      is filled in so the strict-mode validator accepts it.
+    * Newer ``schema_version`` (a peer instance is running ahead of us)
+      is logged and the record is skipped — returning ``None`` makes
+      the caller treat it as "no record" rather than crash.
+
+    The raw blob is mutated in place; the dict is the same one passed
+    in so callers can validate it directly without a re-serialise.
+    """
+    version = payload.get("schema_version")
+    if version is None:
+        # Pre-versioning blob: stamp v1 so model_validate accepts the
+        # extra="forbid" contract.
+        payload["schema_version"] = 1
+        return payload
+    if not isinstance(version, int) or version <= 0:
+        _log.warning(
+            "store.schema_version_invalid",
+            key=key,
+            schema_version=version,
+        )
+        return None
+    if version > CURRENT_SCHEMA_VERSION:
+        _log.warning(
+            "store.schema_version_unsupported",
+            key=key,
+            schema_version=version,
+            supported=CURRENT_SCHEMA_VERSION,
+        )
+        return None
+    return payload
+
+
+def _migrate_step_blob(payload: dict[str, Any], *, key: str) -> dict[str, Any] | None:
+    """Same as ``migrate_run_blob`` for ``StepRecord`` rows.
+
+    Kept separate so future per-model migrations (renaming a field,
+    splitting one into two, etc.) can diverge cleanly.
+    """
+    return migrate_run_blob(payload, key=key)
 
 
 class InMemoryRunStore:

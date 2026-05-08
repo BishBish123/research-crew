@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import secrets
 import time
@@ -29,7 +30,7 @@ from research_crew.models import (
     RunStatus,
     StepStatus,
 )
-from research_crew.store import RedisRunStore, RunStore
+from research_crew.store import RedisRunStore, RunStore, migrate_run_blob
 from research_crew.synthesizer import StitchSynthesizer
 from research_crew.workflow import WorkflowEngine
 
@@ -417,7 +418,11 @@ async def _load_running_run(
 ) -> RunStatus | None:
     """Read + parse a RUNNING blob; return ``None`` for any reason it
     isn't a candidate (transient read error, missing, terminal,
-    unparseable, or state not actually RUNNING)."""
+    unparseable, version too new, or state not actually RUNNING).
+
+    Routes the JSON through ``_migrate_run_blob`` so a pre-versioning
+    blob still parses and a newer-version blob is logged + skipped.
+    """
     try:
         raw = await redis_client.get(key)
     except Exception as exc:  # transient — log and skip this key
@@ -426,7 +431,15 @@ async def _load_running_run(
     if raw is None or '"state":"running"' not in raw:
         return None
     try:
-        run = RunStatus.model_validate_json(raw)
+        payload = json.loads(raw)
+    except Exception as exc:
+        _log.warning("api.reconcile_parse_failed", key=key, error=str(exc))
+        return None
+    migrated = migrate_run_blob(payload, key=key)
+    if migrated is None:
+        return None
+    try:
+        run = RunStatus.model_validate(migrated)
     except Exception as exc:
         _log.warning("api.reconcile_parse_failed", key=key, error=str(exc))
         return None

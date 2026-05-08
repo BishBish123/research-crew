@@ -14,6 +14,7 @@ apply. The shape we lock in:
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -256,5 +257,79 @@ class TestRedisKeyPrefix:
             await store.put_run(_run())
             keys = await fake.keys("*")
             assert keys == ["env:run:r-1"]
+        finally:
+            await fake.aclose()
+
+
+class TestSchemaVersionMigration:
+    """Persisted blobs carry a `schema_version`. Readers must:
+
+    1. Tolerate a missing version (legacy v1 blob written before the
+       field landed) and load it as v1.
+    2. Skip blobs whose `schema_version` exceeds the reader's supported
+       value, with a structured warning — a peer instance running a
+       newer deploy must not crash this older reader.
+    """
+
+    async def test_old_schema_version_loads_with_migration(self) -> None:
+        """Pre-versioning blob (no `schema_version` field) round-trips
+        through `get_run`. The migration path stamps v1 so the strict
+        Pydantic validator accepts it."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            store = RedisRunStore(fake)
+            # Write a blob shaped like a pre-versioning record: no
+            # `schema_version`, no `owner_id`, no `heartbeat_at`.
+            legacy = {
+                "run_id": "legacy-1",
+                "question": "what is python",
+                "state": "running",
+                "steps": [],
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": None,
+                "report": None,
+                "total_latency_ms": None,
+                "error": None,
+                "owner_id": None,
+                "heartbeat_at": None,
+            }
+            await fake.set("research:run:legacy-1", json.dumps(legacy))
+
+            got = await store.get_run("legacy-1")
+            assert got is not None
+            assert got.run_id == "legacy-1"
+            assert got.state is StepStatus.RUNNING
+            assert got.heartbeat_at is None
+        finally:
+            await fake.aclose()
+
+    async def test_newer_schema_version_skipped_gracefully(self) -> None:
+        """A blob from a newer deploy (`schema_version` > current) must
+        be treated as "no record" rather than raising."""
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        try:
+            store = RedisRunStore(fake)
+            future_blob = {
+                "run_id": "future-1",
+                "question": "what is python",
+                "state": "running",
+                "steps": [],
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": None,
+                "report": None,
+                "total_latency_ms": None,
+                "error": None,
+                "owner_id": None,
+                "heartbeat_at": None,
+                "schema_version": 999,
+                # An unknown field a future writer might add — the
+                # skip-on-newer path means we never even validate, so
+                # extra="forbid" doesn't reject us.
+                "future_only_field": "x",
+            }
+            await fake.set("research:run:future-1", json.dumps(future_blob))
+
+            got = await store.get_run("future-1")
+            assert got is None
         finally:
             await fake.aclose()

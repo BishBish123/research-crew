@@ -62,6 +62,13 @@ def _max_question_len() -> int:
 # stripped before validation, and assignment also revalidates.
 _STRICT_MODEL_CONFIG = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+# Persisted-blob schema version. Bump on every breaking change to
+# ``RunStatus`` / ``StepRecord``. Readers consult ``CURRENT_SCHEMA_VERSION``
+# and apply migrations for older versions; newer versions (a peer
+# instance running ahead of this deploy) are logged + skipped instead
+# of crashing the reader.
+CURRENT_SCHEMA_VERSION = 1
+
 
 class Citation(BaseModel):
     """One source the synthesizer references in the final report."""
@@ -99,6 +106,10 @@ class StepRecord(BaseModel):
     started_at: datetime
     finished_at: datetime | None = None
     error: str | None = None
+    # Schema version for the persisted blob. See CURRENT_SCHEMA_VERSION
+    # for the contract; readers consult the value to decide whether to
+    # migrate or skip.
+    schema_version: int = CURRENT_SCHEMA_VERSION
 
 
 class ResearchReport(BaseModel):
@@ -186,3 +197,7 @@ class RunStatus(BaseModel):
     # reconciler only flips runs whose heartbeat is older than the
     # configured stale threshold. None on legacy / pre-heartbeat blobs.
     heartbeat_at: datetime | None = None
+    # Schema version for the persisted blob. See CURRENT_SCHEMA_VERSION
+    # for the contract; readers consult the value to decide whether to
+    # migrate or skip.
+    schema_version: int = CURRENT_SCHEMA_VERSION

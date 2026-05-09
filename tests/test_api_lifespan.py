@@ -22,6 +22,7 @@ import fakeredis.aioredis as fake_aioredis
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from research_crew import api as api_module
 from research_crew.api import (
     _execute_run,
     _heartbeat_loop,
@@ -228,7 +229,9 @@ class TestExecuteRunCancellation:
     sweep — observably "running forever" from the client's perspective.
     """
 
-    async def test_cancelled_run_persists_terminal_state_then_reraises(self) -> None:
+    async def test_cancelled_run_persists_terminal_state_then_reraises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         fake = fake_aioredis.FakeRedis(decode_responses=True)
         store = RedisRunStore(fake)
         shadow = _TerminalShadow()
@@ -241,6 +244,25 @@ class TestExecuteRunCancellation:
         )
         await store.put_run(running)
 
+        # Synchronisation point: monkeypatch the workflow engine so
+        # `run_parallel` signals "I'm running" via an Event, then awaits
+        # forever. The test waits on that Event before cancelling, which
+        # guarantees the cancel lands inside the workflow body — no
+        # `asyncio.sleep`-based "hopefully it started" race.
+        started: asyncio.Event = asyncio.Event()
+
+        async def _stub_run_parallel(
+            self: object, agents: object, question: object
+        ) -> object:
+            started.set()
+            # Block until cancelled by the outer test cancellation.
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable: must be cancelled")
+
+        monkeypatch.setattr(
+            api_module.WorkflowEngine, "run_parallel", _stub_run_parallel, raising=True
+        )
+
         async def _go() -> None:
             await _execute_run(
                 store, shadow, "cancel-me",
@@ -248,8 +270,10 @@ class TestExecuteRunCancellation:
             )
 
         task = asyncio.create_task(_go())
-        # Yield once so the task starts executing the workflow body.
-        await asyncio.sleep(0.01)
+        # Wait deterministically until the bg task is inside the
+        # workflow body — short timeout because anything > a few hundred
+        # ms means the patch didn't take.
+        await asyncio.wait_for(started.wait(), timeout=2.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

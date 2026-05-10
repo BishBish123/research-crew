@@ -64,6 +64,12 @@ The brief asked for Inngest + Redis Streams + LangGraph. **The repo ships the *c
 
 The architecture is the artifact. Live API keys are runtime config — not what a portfolio review should grade.
 
+## Prerequisites
+
+- **Python 3.11 or 3.12** — pinned in `pyproject.toml`; 3.13 is not yet exercised in CI.
+- **[`uv`](https://docs.astral.sh/uv/)** — the project's package manager. `make install` shells out to `uv sync`; the `make api` / `make test` / `make load` targets all wrap `uv run <cmd>`, so anywhere you see `uv run research`, `uv run pytest`, etc., that's `uv` resolving the locked virtualenv before invoking the underlying tool — no global `pip install` step required.
+- **Docker** — only needed for `make up` (brings up the Redis 7.4 container in `docker-compose.yml`). The CLI path (`uv run research ...`) and the unit tests run against an in-memory store, so Docker is optional unless you're exercising the API or the integration suite.
+
 ## Quick start
 
 ```bash

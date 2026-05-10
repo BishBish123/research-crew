@@ -1,7 +1,6 @@
 services:
   redis:
     image: redis:7.4-alpine
-    container_name: research-crew-redis
     ports:
       - "6379:6379"
     volumes:

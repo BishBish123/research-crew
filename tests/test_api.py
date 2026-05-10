@@ -42,7 +42,12 @@ class TestResearchEndpoint:
         assert resp.status_code == 202
         body = resp.json()
         assert "run_id" in body
-        assert body["status_url"].startswith("/runs/")
+        # status_url is now absolute (built via request.url_for) so callers
+        # behind proxies / on a non-default host can poll without
+        # re-deriving the base URL. Should include scheme + host + path.
+        status_url = body["status_url"]
+        assert status_url.startswith("http://") or status_url.startswith("https://")
+        assert status_url.endswith(f"/runs/{body['run_id']}")
 
     async def test_run_completes_and_renders_report(self, client: AsyncClient) -> None:
         resp = await client.post("/research", json={"question": "what is python"})

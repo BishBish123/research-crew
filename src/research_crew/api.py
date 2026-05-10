@@ -746,7 +746,13 @@ async def submit_research(
         raise HTTPException(status_code=503, detail=f"run store unavailable: {exc}") from exc
     _log.info("api.run_submitted", run_id=run_id, question_len=len(payload.question))
     background.add_task(_execute_run, store, _terminal_shadow(request), run_id, payload)
-    return {"run_id": run_id, "status_url": f"/runs/{run_id}"}
+    # Absolute URL so callers behind a proxy / different host can poll
+    # without re-deriving the base. ``request.url_for`` resolves the
+    # named route (`get_run`) against the live request scope, so it
+    # picks up ``X-Forwarded-*`` overrides if uvicorn is run with
+    # ``--forwarded-allow-ips``.
+    status_url = str(request.url_for("get_run", run_id=run_id))
+    return {"run_id": run_id, "status_url": status_url}
 
 
 _TERMINAL_STATES = (StepStatus.SUCCEEDED, StepStatus.FAILED)

@@ -101,7 +101,7 @@ curl http://localhost:8000/runs/<run_id>
 | Verb | Path | Body | Returns |
 | --- | --- | --- | --- |
 | `GET` | `/health` | — | `{ "status": "ok", "redis": "up", "active_runs": 0, "shadow_size": 0 }` |
-| `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "/runs/..." }` |
+| `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "http://host/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
 
 `/health` includes a workload snapshot beyond the basic Redis ping:

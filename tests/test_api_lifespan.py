@@ -26,6 +26,7 @@ from research_crew import api as api_module
 from research_crew.api import (
     _execute_run,
     _heartbeat_loop,
+    _is_dev_mode,
     _reconcile_orphan_runs,
     _TerminalShadow,
     app,
@@ -294,6 +295,27 @@ class TestExecuteRunCancellation:
             assert shadow_entry.error == "cancelled during shutdown"
 
         await fake.aclose()
+
+
+class TestDevMode:
+    """``RESEARCH_DEV_MODE`` is the local-loop opt-out for the
+    auth-disabled WARNING. Truthy values demote the log to INFO; the
+    helper is intentionally narrow (only the standard truthy strings)
+    so a typo doesn't silently silence the warning."""
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "On"])
+    def test_truthy_values(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("RESEARCH_DEV_MODE", value)
+        assert _is_dev_mode() is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "garbage"])
+    def test_falsy_values(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("RESEARCH_DEV_MODE", value)
+        assert _is_dev_mode() is False
+
+    def test_unset_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("RESEARCH_DEV_MODE", raising=False)
+        assert _is_dev_mode() is False
 
 
 @pytest.fixture(autouse=True)

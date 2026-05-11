@@ -156,6 +156,7 @@ spoof XFF to get a fresh bucket.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `RESEARCH_API_TOKEN` | *(unset)* | Bearer token enforced on `/research` and `/runs/{id}`. Unset = unauthenticated dev mode (loud warning logged at startup). |
+| `RESEARCH_DEV_MODE` | *(unset)* | When truthy (`1`, `true`, `yes`, `on`), demotes the unauthenticated-mode `api.auth_disabled` log from WARNING to INFO. Local dev opt-out only — does not affect auth enforcement. |
 | `RESEARCH_RATE_LIMIT_PER_MIN` | `10` | Per-IP sliding-window cap on `POST /research`. Exhausted callers get `429` + `Retry-After`. |
 | `RESEARCH_TRUSTED_PROXIES` | *(empty)* | CSV of proxy IPs. When the immediate peer is in this set, the limiter keys on the first non-trusted IP from `X-Forwarded-For`. Empty = ignore XFF (safe default for direct exposure). |
 | `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. |

@@ -286,13 +286,23 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
             max_size=int(os.environ.get("RESEARCH_SHADOW_MAX", _DEFAULT_SHADOW_MAX))
         )
     # Auth token — when unset, run open and log a loud DEV-ONLY warning
-    # so operators don't ship to prod accidentally.
+    # so operators don't ship to prod accidentally. Local dev loops can
+    # opt out of the WARNING noise by exporting ``RESEARCH_DEV_MODE=1``,
+    # which demotes the same event to INFO; the message body is identical
+    # so a log scrape still surfaces it on the dev path.
     token = os.environ.get("RESEARCH_API_TOKEN")
     if not token:
-        _log.warning(
-            "api.auth_disabled",
-            message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
-        )
+        if _is_dev_mode():
+            _log.info(
+                "api.auth_disabled",
+                message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
+                dev_mode=True,
+            )
+        else:
+            _log.warning(
+                "api.auth_disabled",
+                message="RESEARCH_API_TOKEN not set; running unauthenticated — DEV ONLY",
+            )
     app_.state.api_token = token or None
     # Rate limiter is always wired up; if RESEARCH_RATE_LIMIT_PER_MIN
     # is unset we use the conservative default. Recreate per lifespan
@@ -470,6 +480,18 @@ def _abandonment_reason(
         )
         return None
     return f"abandoned: no heartbeat for {int(age_s)}s (threshold {stale_after_s}s)"
+
+
+def _is_dev_mode() -> bool:
+    """``RESEARCH_DEV_MODE`` truthiness check.
+
+    Accepts the usual truthy strings (``1``, ``true``, ``yes``, ``on``)
+    case-insensitively; everything else (unset, ``0``, ``false``, garbage)
+    is false. Kept narrow on purpose — this only gates the auth-disabled
+    log level, not actual auth enforcement.
+    """
+    raw = os.environ.get("RESEARCH_DEV_MODE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _stale_heartbeat_seconds() -> int:

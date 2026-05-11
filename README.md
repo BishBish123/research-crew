@@ -145,6 +145,26 @@ will then key on the first non-trusted IP from the
 unset (the default) the header is ignored, so a direct caller cannot
 spoof XFF to get a fresh bucket.
 
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RESEARCH_API_TOKEN` | *(unset)* | Bearer token enforced on `/research` and `/runs/{id}`. Unset = unauthenticated dev mode (loud warning logged at startup). |
+| `RESEARCH_RATE_LIMIT_PER_MIN` | `10` | Per-IP sliding-window cap on `POST /research`. Exhausted callers get `429` + `Retry-After`. |
+| `RESEARCH_TRUSTED_PROXIES` | *(empty)* | CSV of proxy IPs. When the immediate peer is in this set, the limiter keys on the first non-trusted IP from `X-Forwarded-For`. Empty = ignore XFF (safe default for direct exposure). |
+| `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. |
+| `RESEARCH_REDIS_PREFIX` | `research` | Key prefix for run / step / cache keys. Set per environment to share one Redis without cross-talk. |
+| `RESEARCH_HEARTBEAT_STALE_S` | `120` | Heartbeat-staleness threshold for the lifespan orphan reconciler. A peer's `RUNNING` run is left alone until its heartbeat is older than this; bumps every 30s while live. |
+
+Bind host / port are CLI flags on the entrypoint, not env vars:
+
+```bash
+uv run research-api --host 0.0.0.0 --port 8000
+```
+
+`--host 0.0.0.0` is what you want inside a container or to expose the
+service on the LAN; the default `127.0.0.1` is loopback-only.
+
 ## Single-process, horizontally-scalable design
 
 The service runs as one FastAPI process — a research call fans out

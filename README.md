@@ -104,6 +104,12 @@ curl http://localhost:8000/runs/<run_id>
 | `POST` | `/research` | `{ "question": "...", "agents": ["web_search", ...] }` | `202 { "run_id": "...", "status_url": "http://host/runs/..." }` |
 | `GET` | `/runs/{id}` | — | `RunStatus` (state, per-step audit, embedded `ResearchReport`) |
 
+The `steps` array on `RunStatus` is an append-only audit log: every
+agent attempt writes one `running` row when it starts and one terminal
+row (`succeeded` / `failed`) when it ends, so a retried step shows up
+as multiple `running` + terminal pairs rather than mutating a single
+record.
+
 `/health` includes a workload snapshot beyond the basic Redis ping:
 
 * `active_runs` — count of run records currently in the `RUNNING`

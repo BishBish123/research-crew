@@ -88,12 +88,12 @@ uv run research "test retries" --failure-rate 0.5
 
 # Run the API
 make api &
-curl -X POST -H 'content-type: application/json' \
+curl -sS -X POST -H 'content-type: application/json' \
     -d '{"question":"how does Inngest handle step retries"}' \
     http://localhost:8000/research
 
 # Get the run status
-curl http://localhost:8000/runs/<run_id>
+curl -sS http://localhost:8000/runs/<run_id>
 ```
 
 ## API
@@ -129,7 +129,7 @@ probe without a credential.
 ```bash
 export RESEARCH_API_TOKEN=$(openssl rand -hex 32)
 make api &
-curl -H "Authorization: Bearer $RESEARCH_API_TOKEN" \
+curl -sS -H "Authorization: Bearer $RESEARCH_API_TOKEN" \
      -H 'content-type: application/json' \
      -d '{"question":"how does Inngest handle step retries"}' \
      http://localhost:8000/research

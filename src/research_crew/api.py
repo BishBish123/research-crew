@@ -1176,6 +1176,17 @@ def serve(
     host: str = typer.Option("127.0.0.1", help="Bind host."),
     port: int = typer.Option(8000, help="Bind port."),
     reload: bool = typer.Option(False, "--reload", help="uvicorn auto-reload"),
+    forwarded_allow_ips: str = typer.Option(
+        "127.0.0.1",
+        "--forwarded-allow-ips",
+        help=(
+            "Comma-separated IPs / CIDRs whose X-Forwarded-* headers uvicorn should trust. "
+            "Required for the absolute `status_url` in API responses to use the public "
+            "scheme/host when running behind a reverse proxy. "
+            "Use `*` to trust any peer (only on a private network). "
+            "Default trusts only loopback."
+        ),
+    ),
 ) -> None:
     """Run the FastAPI service."""
     uvicorn.run(
@@ -1184,6 +1195,8 @@ def serve(
         port=port,
         reload=reload,
         log_level="info",
+        forwarded_allow_ips=forwarded_allow_ips,
+        proxy_headers=True,
     )
 
 

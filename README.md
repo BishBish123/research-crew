@@ -162,12 +162,24 @@ spoof XFF to get a fresh bucket.
 | `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. |
 | `RESEARCH_REDIS_PREFIX` | `research` | Key prefix for run / step / cache keys. Set per environment to share one Redis without cross-talk. |
 | `RESEARCH_HEARTBEAT_STALE_S` | `120` | Heartbeat-staleness threshold for the lifespan orphan reconciler. A peer's `RUNNING` run is left alone until its heartbeat is older than this; bumps every 30s while live. |
+| `RESEARCH_SHADOW_MAX` | `10000` | Maximum entries in the in-process terminal-state shadow cache (only populated while the run store is unreachable). Oldest entry evicted on overflow. |
+| `RESEARCH_MAX_QUESTION_LEN` | `5000` | Hard cap on the `POST /research` `question` field. Requests beyond this length get `422`. |
 
 Bind host / port are CLI flags on the entrypoint, not env vars:
 
 ```bash
 uv run research-api --host 0.0.0.0 --port 8000
+
+# Behind a reverse proxy: tell uvicorn which IPs to trust X-Forwarded-* from
+# (otherwise the absolute `status_url` in API responses uses the internal scheme/host).
+uv run research-api --host 0.0.0.0 --port 8000 \
+  --forwarded-allow-ips '127.0.0.1,10.0.0.0/8'
 ```
+
+The `--forwarded-allow-ips` flag is wired through to `uvicorn.run(..., proxy_headers=True)`,
+so any peer in the trusted list has its `X-Forwarded-Proto` / `X-Forwarded-Host` honoured by
+`request.url_for(...)`. Default is loopback only — sufficient for local dev, **not** for a
+reverse-proxied production deployment.
 
 `--host 0.0.0.0` is what you want inside a container or to expose the
 service on the LAN; the default `127.0.0.1` is loopback-only.

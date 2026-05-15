@@ -537,8 +537,17 @@ async def _store_unavailable_handler(request: Request, exc: StoreUnavailableErro
     return JSONResponse(status_code=503, content={"detail": f"run store unavailable: {exc}"})
 
 
-def _require_auth(request: Request, authorization: str | None) -> None:
+def _require_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
     """Enforce bearer-token auth on the protected routes.
+
+    Uses the pre-parsed ``HTTPAuthorizationCredentials`` from the
+    ``HTTPBearer`` dependency so scheme extraction is handled by FastAPI
+    rather than a manual string split.  The scheme is compared
+    case-insensitively so ``bearer``, ``Bearer``, and ``BEARER`` are
+    all accepted.
 
     No-ops when ``app.state.api_token`` is unset (the dev path) — the
     lifespan logs a loud warning in that case so unauthenticated mode
@@ -547,13 +556,12 @@ def _require_auth(request: Request, authorization: str | None) -> None:
     expected: str | None = getattr(request.app.state, "api_token", None)
     if not expected:
         return
-    if authorization is None or not authorization.startswith(_BEARER_PREFIX):
+    if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
-    presented = authorization[len(_BEARER_PREFIX):].strip()
     # Constant-time compare so a remote caller can't infer the token via
     # response-timing across many guesses. `compare_digest` short-circuits
     # only on length mismatch, which is the documented limit.
-    if not secrets.compare_digest(presented, expected):
+    if not secrets.compare_digest(credentials.credentials, expected):
         raise HTTPException(status_code=401, detail="invalid bearer token")
 
 
@@ -763,7 +771,7 @@ async def submit_research(
     _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> dict[str, str]:
     """Enqueue a research run. Returns immediately with the run_id."""
-    _require_auth(request, request.headers.get(_AUTH_HEADER))
+    _require_auth(request, _credentials)
     _enforce_rate_limit(request)
     run_id = uuid.uuid4().hex
     store = _store(request)
@@ -815,7 +823,7 @@ async def get_run(
     request: Request,
     _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> RunStatus:
-    _require_auth(request, request.headers.get(_AUTH_HEADER))
+    _require_auth(request, _credentials)
     """Return the latest known state for `run_id`.
 
     Lookup precedence (the shadow exists for the bg-task store-outage path

@@ -112,6 +112,26 @@ class TestAuthEnforced:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
+    async def test_auth_accepts_lowercase_bearer_scheme(
+        self, auth_client: AsyncClient
+    ) -> None:
+        """Scheme comparison is case-insensitive: `bearer`, `Bearer`,
+        and `BEARER` must all be accepted when the token is correct.
+
+        Some HTTP clients (curl's default, certain mobile SDKs) emit a
+        lowercase scheme string; rejecting them would break those clients
+        without any security benefit.
+        """
+        for scheme in ("bearer", "Bearer", "BEARER"):
+            resp = await auth_client.post(
+                "/research",
+                json={"question": "what is python"},
+                headers={"Authorization": f"{scheme} secret-test-token"},
+            )
+            assert resp.status_code == 202, (
+                f"scheme '{scheme}' should be accepted; got {resp.status_code}"
+            )
+
 
 class TestAuthOpen:
     async def test_research_open_when_token_unset(self, open_client: AsyncClient) -> None:

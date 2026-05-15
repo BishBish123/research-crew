@@ -163,6 +163,108 @@ class TestReconcileOrphanRuns:
         await fake.aclose()
 
 
+class TestReconcileConcurrentChange:
+    async def test_reconcile_skips_run_with_recent_heartbeat_update(self) -> None:
+        """If the heartbeat_at changes between our observation and the CAS
+        write, the swap must fail and the run must be left RUNNING.
+
+        We simulate a concurrent heartbeat bump by patching
+        cas_reconcile_run to return False (the same outcome as a Redis
+        WATCH violation triggered by a peer heartbeat arriving between our
+        GET and our MULTI/EXEC).
+        """
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        # Plant a RUNNING run with a stale heartbeat so _abandonment_reason
+        # returns a reason (i.e. it passes the staleness check).
+        stale_ts = datetime.now(UTC) - timedelta(minutes=10)
+        orphan = RunStatus(
+            run_id="cas-race-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+            owner_id="dead-worker",
+            heartbeat_at=stale_ts,
+        )
+        await store.put_run(orphan)
+        app.state.redis = fake
+        app.state.store = store
+
+        # Monkey-patch cas_reconcile_run so it returns False,
+        # simulating a concurrent write between our read and the swap.
+        original_cas = store.cas_reconcile_run
+        calls: list[bool] = []
+
+        async def _fake_cas(*args: object, **kwargs: object) -> bool:
+            calls.append(True)
+            return False
+
+        store.cas_reconcile_run = _fake_cas  # type: ignore[method-assign]
+        try:
+            await _reconcile_orphan_runs(app)
+        finally:
+            store.cas_reconcile_run = original_cas  # type: ignore[method-assign]
+
+        # cas_reconcile_run was called (it noticed the stale heartbeat) but
+        # returned False — the run must be untouched.
+        assert calls, "cas_reconcile_run should have been invoked"
+        run = await store.get_run("cas-race-1")
+        assert run is not None
+        assert run.state is StepStatus.RUNNING, (
+            "concurrent swap failure must leave run RUNNING, not FAILED"
+        )
+        await fake.aclose()
+
+    async def test_reconcile_skips_terminal_run(self) -> None:
+        """A run that transitions to a terminal state between our
+        observation and the CAS write must NOT be overwritten.
+
+        We simulate this by making cas_reconcile_run check the current
+        state and return False when it's no longer RUNNING (matching what
+        the real implementation does via WATCH/MULTI/EXEC).
+        """
+        fake = fake_aioredis.FakeRedis(decode_responses=True)
+        store = RedisRunStore(fake)
+        # Plant a RUNNING run with a stale heartbeat.
+        stale_ts = datetime.now(UTC) - timedelta(minutes=10)
+        orphan = RunStatus(
+            run_id="cas-terminal-1",
+            question="what is python",
+            state=StepStatus.RUNNING,
+            owner_id="dead-worker",
+            heartbeat_at=stale_ts,
+        )
+        await store.put_run(orphan)
+
+        # Now advance the run to SUCCEEDED before reconciliation runs,
+        # which is what a real concurrent worker finishing the run looks
+        # like from the reconciler's perspective.
+        finished = RunStatus(
+            run_id="cas-terminal-1",
+            question="what is python",
+            state=StepStatus.SUCCEEDED,
+            owner_id="dead-worker",
+            heartbeat_at=stale_ts,
+            finished_at=datetime.now(UTC),
+        )
+        await store.put_run(finished)
+
+        app.state.redis = fake
+        app.state.store = store
+
+        # The real cas_reconcile_run reads the key inside WATCH and
+        # finds SUCCEEDED — the expected_state RUNNING won't match so
+        # it returns False without writing.
+        await _reconcile_orphan_runs(app)
+
+        run = await store.get_run("cas-terminal-1")
+        assert run is not None
+        assert run.state is StepStatus.SUCCEEDED, (
+            "reconciler must not overwrite a run that finished concurrently"
+        )
+        assert run.abandoned_at is None, "SUCCEEDED run must not carry abandoned_at"
+        await fake.aclose()
+
+
 class TestHeartbeatLoop:
     """The heartbeat loop refreshes `RunStatus.heartbeat_at` while a run
     is RUNNING so peer instances' lifespan reconcilers can tell live

@@ -135,6 +135,72 @@ class RedisRunStore:
     async def cache_put(self, dedup_key: str, result: AgentResult) -> None:
         await self._r.set(self._step_cache_key(dedup_key), result.model_dump_json(), ex=self._ttl)
 
+    def _cas_matches(
+        self,
+        raw: str,
+        key: str,
+        expected_state: StepStatus,
+        expected_heartbeat_at: object,
+    ) -> RunStatus | None:
+        """Parse ``raw`` and return the current RunStatus if it still
+        matches ``expected_state`` + ``expected_heartbeat_at``, else
+        ``None`` (caller should abort the swap).
+        """
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        migrated = migrate_run_blob(payload, key=key)
+        if migrated is None:
+            return None
+        try:
+            current = RunStatus.model_validate(migrated)
+        except Exception:
+            return None
+        if current.state is not expected_state:
+            return None
+        if current.heartbeat_at != expected_heartbeat_at:
+            return None
+        return current
+
+    async def cas_reconcile_run(
+        self,
+        run_id: str,
+        expected_state: StepStatus,
+        expected_heartbeat_at: object,
+        new_run: RunStatus,
+    ) -> bool:
+        """Compare-and-swap a run record using Redis WATCH/MULTI/EXEC.
+
+        WATCHes the run key, reads the current value, validates that
+        ``state`` and ``heartbeat_at`` still match the observed values
+        the caller checked before deciding to reconcile, then atomically
+        writes ``new_run`` under MULTI/EXEC.
+
+        Returns ``True`` on a successful swap, ``False`` if the WATCH
+        fired (another writer changed the key concurrently) or if the
+        current value no longer matches the expected state/heartbeat.
+        Any other Redis error propagates to the caller.
+        """
+        key = self._run_key(run_id)
+        async with self._r.pipeline() as pipe:
+            try:
+                await pipe.watch(key)
+                raw = await pipe.get(key)
+                if raw is None or self._cas_matches(
+                    raw, key, expected_state, expected_heartbeat_at
+                ) is None:
+                    await pipe.reset()  # type: ignore[no-untyped-call]
+                    return False
+                # State and heartbeat match — attempt the atomic write.
+                pipe.multi()  # type: ignore[no-untyped-call]
+                pipe.set(key, new_run.model_dump_json(), ex=self._ttl * 24)
+                await pipe.execute()
+                return True
+            except aioredis.WatchError:
+                # Another writer changed the key between WATCH and EXEC.
+                return False
+
 
 def migrate_run_blob(payload: dict[str, Any], *, key: str) -> dict[str, Any] | None:
     """Bring a persisted RunStatus dict up to ``CURRENT_SCHEMA_VERSION``.

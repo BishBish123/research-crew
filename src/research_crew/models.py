@@ -201,3 +201,8 @@ class RunStatus(BaseModel):
     # for the contract; readers consult the value to decide whether to
     # migrate or skip.
     schema_version: int = CURRENT_SCHEMA_VERSION
+    # Timestamp set by the lifespan reconciler when a RUNNING run is
+    # confirmed as abandoned (compare-and-swap succeeded) and flipped to
+    # FAILED. Distinguishes a reconciler-synthesised FAILED record from a
+    # run that actually failed mid-execution.
+    abandoned_at: datetime | None = None

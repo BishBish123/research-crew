@@ -413,13 +413,29 @@ async def _reconcile_one(
     abandon_reason = _abandonment_reason(run, now=now, stale_after_s=stale_after_s)
     if abandon_reason is None:
         return "skipped_live"
+    # Capture the heartbeat observed *before* the flip so the CAS can
+    # verify nothing changed between our read and our write.
+    observed_heartbeat = run.heartbeat_at
     run.state = StepStatus.FAILED
     run.finished_at = now
+    run.abandoned_at = now
     run.error = abandon_reason
     try:
-        await store.put_run(run)
+        swapped = await store.cas_reconcile_run(
+            run.run_id,
+            expected_state=StepStatus.RUNNING,
+            expected_heartbeat_at=observed_heartbeat,
+            new_run=run,
+        )
     except Exception as exc:
         _log.warning("api.reconcile_put_failed", run_id=run.run_id, error=str(exc))
+        return "noop"
+    if not swapped:
+        _log.info(
+            "api.reconcile_skipped_concurrent_change",
+            run_id=run.run_id,
+            reason="skipped: concurrent change",
+        )
         return "noop"
     return "reconciled"
 

@@ -19,8 +19,10 @@ import structlog
 import typer
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from redis.exceptions import RedisError
 
 from research_crew.agents import default_agents
@@ -192,7 +194,10 @@ class _RateLimiter:
 # unauthenticated" path without surfacing it as a special case in the
 # OpenAPI doc. We *also* declare the FastAPI `HTTPBearer` security
 # scheme as a dependency so /openapi.json advertises the bearer
-# requirement to clients.
+# requirement when ``RESEARCH_API_TOKEN`` is configured. When the token
+# is unset, a custom OpenAPI override strips the security declarations
+# from the spec so the "Authorise" button doesn't appear for an open
+# endpoint.
 _AUTH_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
 _bearer_scheme = HTTPBearer(auto_error=False, description="Bearer token issued out-of-band.")
@@ -530,6 +535,41 @@ def _stale_heartbeat_seconds() -> int:
 app = FastAPI(title="research-crew", version="0.1.0", lifespan=_lifespan)
 
 
+def _build_openapi() -> dict[str, object]:
+    """Custom OpenAPI schema builder.
+
+    When ``RESEARCH_API_TOKEN`` is not set the service runs
+    unauthenticated; in that case we strip the bearer security scheme
+    and per-route ``security`` declarations from the generated spec so
+    the Swagger UI "Authorise" button doesn't appear and generated
+    clients don't add an empty ``Authorization`` header. The routes'
+    ``responses`` dict still lists 401 (our ``_AUTH_RESPONSES``
+    reference includes it), which is accurate — if an operator later
+    sets the token without redeploying the service will start enforcing
+    it.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    if not os.environ.get("RESEARCH_API_TOKEN"):
+        # Strip bearer security scheme.
+        schema.get("components", {}).pop("securitySchemes", None)
+        # Strip per-route security declarations.
+        for _path, methods in schema.get("paths", {}).items():
+            for _method, op in methods.items():
+                if isinstance(op, dict):
+                    op.pop("security", None)
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _build_openapi  # type: ignore[method-assign]
+
+
 @app.exception_handler(StoreUnavailableError)
 async def _store_unavailable_handler(request: Request, exc: StoreUnavailableError) -> JSONResponse:
     """Map any leaked StoreUnavailableError to a typed 503."""
@@ -754,8 +794,22 @@ def _store(request: Request) -> RunStore:
     return store  # type: ignore[no-any-return]
 
 
+class ErrorDetail(BaseModel):
+    """Standard error body shape for 4xx / 5xx responses.
+
+    Declared here so every protected route can reference it in its
+    ``responses`` dict, making the OpenAPI schema emit a typed model
+    reference instead of a plain ``{}`` schema for error responses.
+    """
+
+    detail: str
+
+
 _AUTH_RESPONSES: dict[int | str, dict[str, object]] = {
-    401: {"description": "Missing or invalid bearer token."},
+    401: {"model": ErrorDetail, "description": "Missing or invalid bearer token."},
+    422: {"description": "Validation error."},
+    429: {"description": "Rate limit exceeded."},
+    503: {"description": "Run store unavailable."},
 }
 
 

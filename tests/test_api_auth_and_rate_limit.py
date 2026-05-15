@@ -18,6 +18,7 @@ that's the same shape the existing API tests use for `app.state.store`.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 
 import fakeredis.aioredis as fake_aioredis
@@ -145,28 +146,86 @@ class TestAuthOpen:
 
 
 class TestOpenApiSecurityScheme:
-    """The OpenAPI doc must advertise the bearer scheme + a 401 response
-    on the protected routes so generated clients know to send the
-    `Authorization: Bearer …` header.
+    """OpenAPI security scheme and 401 response body shape.
+
+    When ``RESEARCH_API_TOKEN`` is set (auth_client fixture), the bearer
+    security scheme must be advertised and 401 responses must reference
+    the ``ErrorDetail`` model. When the token is unset (open_client),
+    the scheme must be absent so the Swagger UI "Authorise" button does
+    not confuse users of an open endpoint.
     """
 
-    async def test_openapi_advertises_bearer_scheme(self, open_client: AsyncClient) -> None:
-        r = await open_client.get("/openapi.json")
-        assert r.status_code == 200
-        spec = r.json()
+    async def test_openapi_advertises_bearer_scheme_when_token_set(
+        self, auth_client: AsyncClient
+    ) -> None:
+        # Clear any cached schema from a prior test so the env-var check
+        # inside _build_openapi() runs fresh.
+        app.openapi_schema = None  # type: ignore[assignment]
+        os.environ["RESEARCH_API_TOKEN"] = "secret-test-token"  # noqa: S105
+        try:
+            r = await auth_client.get("/openapi.json")
+            assert r.status_code == 200
+            spec = r.json()
 
-        # Security scheme is declared.
-        schemes = spec.get("components", {}).get("securitySchemes", {})
-        assert any(
-            s.get("type") == "http" and s.get("scheme") == "bearer"
-            for s in schemes.values()
-        ), f"expected an HTTP bearer security scheme; got {schemes}"
+            # Security scheme is declared.
+            schemes = spec.get("components", {}).get("securitySchemes", {})
+            assert any(
+                s.get("type") == "http" and s.get("scheme") == "bearer"
+                for s in schemes.values()
+            ), f"expected an HTTP bearer security scheme; got {schemes}"
 
-        # 401 response is documented on /research and /runs/{run_id}.
-        post_research = spec["paths"]["/research"]["post"]
-        get_run = spec["paths"]["/runs/{run_id}"]["get"]
-        assert "401" in post_research["responses"]
-        assert "401" in get_run["responses"]
+            # 401 response is documented on /research and /runs/{run_id}.
+            post_research = spec["paths"]["/research"]["post"]
+            get_run = spec["paths"]["/runs/{run_id}"]["get"]
+            assert "401" in post_research["responses"]
+            assert "401" in get_run["responses"]
+        finally:
+            os.environ.pop("RESEARCH_API_TOKEN", None)
+            app.openapi_schema = None  # type: ignore[assignment]
+
+    async def test_openapi_omits_bearer_scheme_when_token_unset(
+        self, open_client: AsyncClient
+    ) -> None:
+        """No token configured → security scheme must be absent from the
+        OpenAPI spec to avoid a confusing "Authorise" button.
+        """
+        os.environ.pop("RESEARCH_API_TOKEN", None)
+        app.openapi_schema = None  # type: ignore[assignment]
+        try:
+            r = await open_client.get("/openapi.json")
+            assert r.status_code == 200
+            spec = r.json()
+            schemes = spec.get("components", {}).get("securitySchemes", {})
+            assert not any(
+                s.get("type") == "http" and s.get("scheme") == "bearer"
+                for s in schemes.values()
+            ), f"expected no HTTP bearer security scheme when token unset; got {schemes}"
+        finally:
+            app.openapi_schema = None  # type: ignore[assignment]
+
+    async def test_openapi_401_references_error_detail_model(
+        self, auth_client: AsyncClient
+    ) -> None:
+        """401 responses on protected routes must reference the typed
+        ``ErrorDetail`` schema so generated clients get a proper model.
+        """
+        os.environ["RESEARCH_API_TOKEN"] = "secret-test-token"  # noqa: S105
+        app.openapi_schema = None  # type: ignore[assignment]
+        try:
+            r = await auth_client.get("/openapi.json")
+            assert r.status_code == 200
+            spec = r.json()
+            post_401 = spec["paths"]["/research"]["post"]["responses"]["401"]
+            # FastAPI emits a `$ref` to the model under content > application/json > schema.
+            content = post_401.get("content", {})
+            json_content = content.get("application/json", {})
+            schema = json_content.get("schema", {})
+            assert "$ref" in schema or "properties" in schema, (
+                f"401 response should reference ErrorDetail schema; got {post_401}"
+            )
+        finally:
+            os.environ.pop("RESEARCH_API_TOKEN", None)
+            app.openapi_schema = None  # type: ignore[assignment]
 
 
 class TestRateLimit:

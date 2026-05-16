@@ -161,7 +161,7 @@ spoof XFF to get a fresh bucket.
 | `RESEARCH_TRUSTED_PROXIES` | *(empty)* | CSV of proxy IPs. When the immediate peer is in this set, the limiter keys on the first non-trusted IP from `X-Forwarded-For`. Empty = ignore XFF (safe default for direct exposure). |
 | `REDIS_URL` | `redis://localhost:6379/0` | Connection URL for the run store. |
 | `RESEARCH_REDIS_PREFIX` | `research` | Key prefix for run / step / cache keys. Set per environment to share one Redis without cross-talk. |
-| `RESEARCH_HEARTBEAT_STALE_S` | `120` | Heartbeat-staleness threshold for the lifespan orphan reconciler. A peer's `RUNNING` run is left alone until its heartbeat is older than this; bumps every 30s while live. |
+| `RESEARCH_HEARTBEAT_STALE_S` | `120` | Heartbeat-staleness threshold for the lifespan orphan reconciler. A peer's `RUNNING` run is left alone when its heartbeat age is less than or equal to this value; the run is considered abandoned only when the age is strictly greater than (older than) the threshold. Bumps every 30s while live. |
 | `RESEARCH_SHADOW_MAX` | `10000` | Maximum entries in the in-process terminal-state shadow cache (only populated while the run store is unreachable). Oldest entry evicted on overflow. |
 | `RESEARCH_MAX_QUESTION_LEN` | `5000` | Hard cap on the `POST /research` `question` field. Requests beyond this length get `422`. |
 

@@ -491,7 +491,7 @@ def _abandonment_reason(
         # from a true orphan, so treat as abandoned.
         return "abandoned by previous process"
     age_s = (now - run.heartbeat_at).total_seconds()
-    if age_s < stale_after_s:
+    if age_s <= stale_after_s:
         _log.info(
             "api.reconcile_skipped_live",
             run_id=run.run_id,

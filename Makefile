@@ -43,7 +43,8 @@ api: ## Run the FastAPI service locally
 	$(UV) run research-api
 
 .PHONY: up
-up: ## Start Redis container
+up: ## Start Redis container (override port: REDIS_PORT=6390 make up)
+	docker compose down --remove-orphans 2>/dev/null || true
 	docker compose up -d --wait
 
 .PHONY: down
